@@ -8,6 +8,6 @@
     "puppeteer": "^21.5.0"
   },
   "scripts": {
-    "postinstall": "node node_modules/puppeteer/install.mjs"
+    "postinstall": "echo 'Skipping browser download'"
   }
 }
