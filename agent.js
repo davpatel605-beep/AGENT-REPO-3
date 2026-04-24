@@ -4,18 +4,19 @@ const puppeteer = require('puppeteer');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 async function runAgent() {
-    console.log("Agent starting task...");
+    console.log("Agent starting task for first 20 products...");
     const browser = await puppeteer.launch({ 
         headless: "new",
         args: ['--no-sandbox', '--disable-setuid-sandbox'] 
     });
     const page = await browser.newPage();
-
-    // Set User Agent to avoid immediate bot detection
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36');
 
-    // 1. Fetching products from Supabase
-    const { data: products, error } = await supabase.from('products').select('id, product_url');
+    // Here we added '.limit(20)' to test only the first 20 products
+    const { data: products, error } = await supabase
+        .from('products')
+        .select('id, product_url')
+        .limit(20);
     
     if (error) {
         console.error("Supabase Connection Error:", error);
@@ -28,7 +29,6 @@ async function runAgent() {
                 console.log(`Checking URL: ${product.product_url}`);
                 await page.goto(product.product_url, { waitUntil: 'domcontentloaded', timeout: 60000 });
                 
-                // Scraping logic using selectors
                 const details = await page.evaluate(() => {
                     const price = document.querySelector('.Nx9bqj')?.innerText.replace(/[₹,]/g, '');
                     const mrp = document.querySelector('.yRaY8j')?.innerText.replace(/[₹,]/g, '');
@@ -38,7 +38,6 @@ async function runAgent() {
                     return { price, mrp, rating, discount };
                 });
 
-                // 2. Updating Supabase table
                 await supabase.from('products').update({
                     current_price: details.price,
                     original_price: details.mrp,
@@ -46,9 +45,7 @@ async function runAgent() {
                     discount_percent: details.discount
                 }).eq('id', product.id);
 
-                console.log(`Success: Price updated to ${details.price}`);
-                
-                // Adding a 5-second delay to mimic human behavior
+                console.log(`Success: Updated product ID ${product.id}`);
                 await new Promise(r => setTimeout(r, 5000)); 
             } catch (e) {
                 console.log(`Failed to process: ${product.product_url}`);
@@ -56,7 +53,8 @@ async function runAgent() {
         }
     }
     await browser.close();
-    console.log("Task Completed Successfully!");
+    console.log("Test Task Completed!");
 }
 
 runAgent();
+
