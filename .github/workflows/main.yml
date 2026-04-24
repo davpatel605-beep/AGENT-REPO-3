@@ -13,7 +13,6 @@ jobs:
         with:
           node-version: '18'
 
-      # यह स्टेप आपकी फाइल्स को सेव और रीस्टोर करेगा
       - name: Cache Node Modules
         uses: actions/cache@v3
         with:
@@ -24,6 +23,8 @@ jobs:
 
       - name: Install dependencies
         run: npm install
+        env:
+          PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 'true'
 
       - name: Run Agent
         run: node agent.js
