@@ -1,0 +1,10 @@
+  {
+  "name": "price-yaar-agent",
+  "version": "1.0.0",
+  "description": "Price Yaar Scraper Agent",
+  "main": "agent.js",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "puppeteer": "^21.5.0"
+  }
+}
