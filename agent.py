@@ -120,7 +120,7 @@ log = logging.getLogger("PriceYaarSuperAgent")
 def get_supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def fetch_category_products(sb: Client, table: str, limit: int = 10) -> list[dict]:
+def fetch_category_products(sb: Client, table: str, limit: int = 10) -> List[Dict]:
     """
     Fetch products from Supabase.
     """
