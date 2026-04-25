@@ -1,17 +1,9 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  PRICEYAAR SUPER AGENT v8.0 - FULL LENGTH & ANTI-BOT EDITION         ║
-║  Python + Playwright + DOM Strikethrough + EARBUDS ONLY (20 items)   ║
+║  PRICEYAAR SUPER AGENT v8.1 - FULL LENGTH & ANTI-BOT EDITION         ║
+║  Python + Playwright + DOM Strikethrough + Safe GitHub Actions Fix   ║
 ╚══════════════════════════════════════════════════════════════════════╝
-
-WHAT'S NEW IN v8.0:
-- AUTO-INSTALLER: Installs required packages (playwright, stealth, supabase) automatically.
-- TRUNCATED URL FIX: Detects incomplete URLs from Supabase.
-- FLIPKART SEARCH FALLBACK: If URL is bad → search by product name → get real URL.
-- AUTO DB UPDATE: Saves the corrected URL back to Supabase.
-- PLAYWRIGHT STEALTH & HUMAN BEHAVIOR: Mouse movements, delays, and referers.
-- All original logic intact: DOM strikethrough, CSS fallback, text parsing.
 """
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -22,7 +14,7 @@ import subprocess
 import os
 
 def ensure_dependencies():
-    """Automatically installs required pip packages and Playwright browsers if not found."""
+    """Automatically installs required pip packages if not found."""
     try:
         reqs = subprocess.check_output([sys.executable, '-m', 'pip', 'freeze']).decode('utf-8').lower()
     except Exception as e:
@@ -43,7 +35,7 @@ def ensure_dependencies():
     print("[*] Ensuring Playwright browsers are installed...")
     try:
         subprocess.check_call([sys.executable, '-m', 'playwright', 'install', 'chromium'])
-    except Exception as e:
+    except Exception:
         pass 
 
 ensure_dependencies()
@@ -60,8 +52,19 @@ from datetime import datetime
 from typing import Optional, Dict, List, Tuple
 
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
-from playwright_stealth import stealth_async
 from supabase import create_client, Client
+
+# -----------------------------------------------------------------------
+# FIX 1: SAFE STEALTH IMPORT FOR GITHUB ACTIONS
+# अगर stealth_async इम्पोर्ट फेल होता है, तो कोड क्रैश नहीं होगा।
+# -----------------------------------------------------------------------
+try:
+    from playwright_stealth import stealth_async
+    STEALTH_AVAILABLE = True
+except ImportError:
+    stealth_async = None
+    STEALTH_AVAILABLE = False
+    print("⚠️ WARNING: playwright-stealth module not found or import failed. Using manual evasions only.")
 
 
 # ─────────────────────────────────────────────
@@ -73,7 +76,7 @@ if not SUPABASE_URL:
 
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not SUPABASE_KEY:
-    logging.error("CRITICAL ERROR: SUPABASE_KEY is missing. Please set it in your environment/GitHub Secrets.")
+    print("CRITICAL ERROR: SUPABASE_KEY is missing. Please set it in your environment/GitHub Secrets.")
     sys.exit(1)
 
 TEST_MODE = True
@@ -97,19 +100,11 @@ AGENTS = [a for a in ALL_AGENTS if a["name"] == "earbuds"] if TEST_MODE else ALL
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 DELAY_MIN = 2.0
 DELAY_MAX = 5.0
-
-PAGE_LOAD_TIMEOUT = 180000
-NAVIGATION_WAIT = "domcontentloaded"
+PAGE_LOAD_TIMEOUT = 120000  # 120 seconds
 MAX_SCRAPE_RETRIES = 3
-
-# Minimum length a valid Flipkart product URL should be
 MIN_URL_LENGTH = 60
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(message)s",
-    datefmt="%H:%M:%S"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("PriceYaarSuperAgent")
 
 
@@ -121,10 +116,6 @@ def get_supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def fetch_category_products(sb: Client, table: str, limit: int = 10) -> List[Dict]:
-    """
-    Fetch products from Supabase.
-    FIXED: Using List[Dict] instead of list[dict] for compatibility.
-    """
     actual_limit = TEST_BATCH_SIZE if TEST_MODE else limit
     try:
         res = sb.table(table).select("*").limit(actual_limit).execute()
@@ -144,281 +135,92 @@ def update_product(sb: Client, table: str, product_id, data: dict):
         return False
 
 def update_product_url(sb: Client, table: str, product_id, url_col: str, new_url: str) -> bool:
-    """
-    Save the corrected (recovered) Flipkart URL back to Supabase.
-    """
     try:
         sb.table(table).update({url_col: new_url}).eq("id", product_id).execute()
-        log.info(f"  💾 Corrected URL saved to DB for id={product_id}")
         return True
-    except Exception as e:
-        log.error(f"  ❌ URL update failed for id={product_id}: {e}")
+    except Exception:
         return False
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  SECTION 2: STRICT PRICE VALIDATION
-# ═══════════════════════════════════════════════════════════════════════
-
-def validate_prices(selling_price: float, original_price: float) -> dict:
-    valid_selling = selling_price if (100 < selling_price < 50000000) else 0
-    valid_original = 0
-    discount_str = None
-    discount_pct = 0
-
-    if valid_selling > 0 and original_price > 0:
-        is_higher = original_price > valid_selling
-        min_ratio = original_price >= valid_selling * 1.05
-        max_ratio = original_price <= valid_selling * 3.0
-
-        if is_higher and min_ratio and max_ratio:
-            pct = round(((original_price - valid_selling) / original_price) * 100)
-            if 1 <= pct <= 90:
-                valid_original = original_price
-                discount_str = f"{pct}% off"
-                discount_pct = pct
-
-    final_selling = valid_selling if valid_selling > 0 else (
-        original_price if (100 < original_price < 50000000) else 0
-    )
-
-    return {
-        "final_selling": final_selling,
-        "valid_original": valid_original,
-        "discount_str": discount_str,
-        "discount_pct": discount_pct
-    }
-
-def parse_indian_number(s: str) -> Optional[float]:
-    if not s:
-        return None
-    s = str(s).strip().replace(",", "").replace("₹", "").replace(" ", "")
-    if s.lower().endswith("k"):
-        try:
-            return float(s[:-1]) * 1000
-        except:
-            return None
-    try:
-        return float(s)
-    except:
-        return None
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  SECTION 2B: TRUNCATED URL DETECTION & FLIPKART SEARCH FALLBACK
+#  SECTION 2: TRUNCATED URL DETECTION & FLIPKART SEARCH FALLBACK
 # ═══════════════════════════════════════════════════════════════════════
 
 def is_url_truncated(url: str) -> bool:
-    if not url:
-        return True
-
+    if not url: return True
     url = url.strip()
-
-    if url.endswith("...") or url.endswith("-...") or url.endswith("…"):
-        log.warning(f"  ⚠️ URL ends with ellipsis (truncated): {url}")
-        return True
-
-    if len(url) < MIN_URL_LENGTH:
-        log.warning(f"  ⚠️ URL too short ({len(url)} chars): {url}")
-        return True
-
-    if not url.startswith("http"):
-        log.warning(f"  ⚠️ URL does not start with http: {url}")
-        return True
-
-    if "flipkart.com" not in url:
-        log.warning(f"  ⚠️ Not a Flipkart URL: {url}")
-        return True
-
-    if "/p/" not in url:
-        log.warning(f"  ⚠️ URL missing '/p/' segment (not a product page): {url}")
-        return True
-
-    if " " in url:
-        log.warning(f"  ⚠️ URL contains spaces: {url}")
-        return True
-
+    if url.endswith("...") or url.endswith("-...") or url.endswith("…"): return True
+    if len(url) < MIN_URL_LENGTH: return True
+    if not url.startswith("http"): return True
+    if "flipkart.com" not in url: return True
+    if "/p/" not in url: return True
+    if " " in url: return True
     return False
-
 
 async def search_flipkart_for_url(page: Page, product_name: str) -> Optional[str]:
     if not product_name or product_name == "Unknown":
-        log.error("  ❌ Cannot search Flipkart: product name is empty or Unknown")
         return None
-
     search_query = product_name.strip().replace(" ", "+")
     search_url = f"https://www.flipkart.com/search?q={search_query}"
     log.info(f"  🔍 Searching Flipkart for: '{product_name}'")
-    log.info(f"  🔍 Search URL: {search_url}")
 
     try:
-        # Applying Google referer to bypass bot detection on search
         await page.goto(search_url, referer="https://www.google.com/", wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
         await asyncio.sleep(random.uniform(2.5, 5.0))
 
-        if await is_captcha_or_blocked(page):
-            log.warning("  🤖 Bot block on search page. Cannot recover URL.")
-            return None
-
-        product_link_selectors = [
-            "a[href*='/p/itm']",
-            "a._1fQZEK",
-            "a.s1Q9rs",
-            "a._2rpwqI",
-            "div._1AtVbE a",
-            "div._13oc-S a",
-            "div.CXW8mj a",
-            "a[data-id]",
-        ]
-
-        found_url = None
+        product_link_selectors = ["a[href*='/p/itm']", "a._1fQZEK", "a.s1Q9rs", "div._1AtVbE a"]
         for sel in product_link_selectors:
             try:
                 links = page.locator(sel)
-                count = await links.count()
-                if count > 0:
+                if await links.count() > 0:
                     href = await links.first.get_attribute("href")
                     if href:
-                        if href.startswith("/"):
-                            href = "https://www.flipkart.com" + href
+                        if href.startswith("/"): href = "https://www.flipkart.com" + href
                         if "flipkart.com" in href and "/p/" in href:
-                            found_url = href
-                            log.info(f"  ✅ Found URL via selector '{sel}': {found_url[:80]}...")
-                            break
+                            return href
             except:
                 continue
-
-        if not found_url:
-            log.warning("  ⚠️ Standard selectors failed, scanning all links...")
-            all_hrefs = await page.evaluate("""
-                () => {
-                    const links = Array.from(document.querySelectorAll('a[href]'));
-                    return links
-                        .map(a => a.href)
-                        .filter(h => h.includes('/p/itm') || h.includes('/p/ITM'));
-                }
-            """)
-            if all_hrefs:
-                found_url = all_hrefs[0]
-                log.info(f"  ✅ Found URL via full scan: {found_url[:80]}...")
-
-        if found_url:
-            return found_url
-        else:
-            log.error(f"  ❌ No product URL found on search page for: '{product_name}'")
-            return None
-
     except Exception as e:
-        log.error(f"  ❌ Flipkart search failed for '{product_name}': {e}")
-        return None
+        log.error(f"  ❌ Search failed: {e}")
+    return None
 
-
-async def resolve_product_url(
-    page: Page,
-    product: dict,
-    sb: Client,
-    table: str,
-    product_id
-) -> Optional[str]:
+async def resolve_product_url(page: Page, product: dict, sb: Client, table: str, product_id) -> Optional[str]:
     url_col_candidates = ["Product Link", "product_url", "link", "Product URL", "url"]
-    url = get_dict_value_ignore_case(product, url_col_candidates)
-    url_col = find_real_column_name(list(product.keys()), url_col_candidates)
-
-    log.info(f"  🔗 Raw URL from DB: {url[:80] if url else 'EMPTY'}...")
+    url = None
+    url_col = None
+    for key, value in product.items():
+        if key.lower() in [c.lower() for c in url_col_candidates] and value:
+            url = str(value)
+            url_col = key
+            break
 
     if is_url_truncated(url):
-        log.warning(f"  ⚠️ URL is truncated or invalid. Attempting Flipkart search fallback...")
-
-        product_name = get_dict_value_ignore_case(
-            product, ["Product Name-2", "Product Name", "name", "Brand Name"]
-        )
-
-        recovered_url = await search_flipkart_for_url(page, product_name)
-
+        log.warning(f"  ⚠️ URL Invalid. Attempting Search fallback...")
+        name = product.get("Product Name-2") or product.get("Product Name") or product.get("name")
+        recovered_url = await search_flipkart_for_url(page, name)
         if recovered_url:
             log.info(f"  🔧 URL recovered: {recovered_url[:80]}...")
             if url_col and product_id:
                 update_product_url(sb, table, product_id, url_col, recovered_url)
             return recovered_url
-        else:
-            log.error(f"  ❌ Could not recover URL for product: '{product_name}'. Skipping.")
-            return None
-
+        return None
     return url
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  SECTION 3: FLIPKART CSS SELECTORS
-# ═══════════════════════════════════════════════════════════════════════
-
-FLIPKART_SELECTORS = {
-    "selling_price": [
-        "div._30jeq3._16Jk6d",
-        "div._30jeq3",
-        "._16Jk6d",
-        "[class*='_30jeq3']",
-        "div.Nx9bqj",
-        "div._25b18c ._30jeq3",
-        "div.UOCQB1 ._30jeq3",
-        "span._30jeq3",
-        "._30jeq3._16Jk6d",
-    ],
-    "original_price": [
-        "div._3I9_wc._2p6lqe",
-        "div._3I9_wc",
-        "._2p6lqe",
-        "[class*='_3I9_wc']",
-        "div.yRaY8j",
-        "div._3I9_wc._2p6lqe",
-        "span._3I9_wc",
-        "._3I9_wc._2p6lqe",
-    ],
-    "discount": [
-        "div._3Ay6Sb._31Dcoz ._3Ay6Sb",
-        "div._3Ay6Sb",
-        "._31Dcoz",
-        "[class*='_3Ay6Sb']",
-        "div.UkUFwK span",
-        "span._3Ay6Sb",
-    ],
-    "rating": [
-        "div._3LWZlK",
-        "div._3LWZlK._1rdVr6",
-        "[class*='_3LWZlK']",
-        "div.XQDdHH",
-        "span._3LWZlK",
-    ],
-    "reviews": [
-        "span._2_R_DZ",
-        "span._13vcmD",
-        "[class*='_2_R_DZ']",
-        "div._2_R_DZ",
-    ]
-}
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  SECTION 4: DOM STRIKETHROUGH DETECTION (KEY FEATURE)
+#  SECTION 3: EXTRACTION LOGIC (DOM, CSS, TEXT)
 # ═══════════════════════════════════════════════════════════════════════
 
 async def extract_with_dom_strikethrough(page: Page) -> dict:
     return await page.evaluate("""
         () => {
-            const result = {
-                sellingPrice: null,
-                originalPrice: null,
-                discountPercent: null,
-                rating: null,
-                reviews: null
-            };
-
+            const result = { sellingPrice: null, originalPrice: null };
             const allElements = document.querySelectorAll('*');
             const rupeeElements = [];
 
             for (const el of allElements) {
                 const text = el.textContent || '';
                 if (!text.includes('₹')) continue;
-
                 const style = window.getComputedStyle(el);
                 if (style.display === 'none' || style.visibility === 'hidden') continue;
 
@@ -429,618 +231,196 @@ async def extract_with_dom_strikethrough(page: Page) -> dict:
                     const num = parseInt(match.replace(/[^0-9]/g, ''));
                     if (num < 500) continue;
 
-                    const isStrike = style.textDecoration.includes('line-through') ||
-                                     el.closest('[style*="line-through"]') !== null;
-
+                    let isOriginal = style.textDecoration.includes('line-through') || el.closest('[style*="line-through"]') !== null;
                     let parent = el.parentElement;
-                    let parentStrike = false;
                     for (let i = 0; i < 3 && parent; i++) {
-                        const ps = window.getComputedStyle(parent);
-                        if (ps.textDecoration.includes('line-through')) {
-                            parentStrike = true;
-                            break;
+                        if (window.getComputedStyle(parent).textDecoration.includes('line-through')) {
+                            isOriginal = true; break;
                         }
                         parent = parent.parentElement;
                     }
-
-                    const isOriginal = isStrike || parentStrike;
-
-                    const lowerText = text.toLowerCase();
-                    const badKeywords = ['emi', '/m', 'per month', 'monthly',
-                                        'warranty', 'protection', 'insurance',
-                                        'case', 'cover', 'screen guard', 'charger'];
-                    const isBad = badKeywords.some(k => lowerText.includes(k));
-                    if (isBad) continue;
-
-                    rupeeElements.push({ match, num, isOriginal });
+                    rupeeElements.push({ num, isOriginal });
                 }
             }
 
             if (rupeeElements.length > 0) {
                 const originals = rupeeElements.filter(e => e.isOriginal).map(e => e.num);
                 const sellings = rupeeElements.filter(e => !e.isOriginal).map(e => e.num);
-
-                const uniqueOriginals = [...new Set(originals)].sort((a, b) => b - a);
-                const uniqueSellings = [...new Set(sellings)].sort((a, b) => a - b);
-
-                if (uniqueSellings.length > 0) {
-                    result.sellingPrice = uniqueSellings[0];
-                }
-                if (uniqueOriginals.length > 0) {
-                    result.originalPrice = uniqueOriginals[0];
-                }
+                if (sellings.length > 0) result.sellingPrice = Math.min(...sellings);
+                if (originals.length > 0) result.originalPrice = Math.max(...originals);
             }
-
-            const bodyText = document.body.innerText || '';
-            const discMatch = bodyText.match(/[↓]\\s*(\\d{1,2})\\s*%/);
-            if (discMatch) {
-                result.discountPercent = parseInt(discMatch[1]);
-            } else {
-                const discMatch2 = bodyText.match(/(\\d{1,2})\\s*%\\s*(?:off|Off|OFF)/);
-                if (discMatch2) result.discountPercent = parseInt(discMatch2[1]);
-            }
-
-            const ratingMatch = bodyText.match(/(\\d\\.\\d)\\s*★/);
-            if (ratingMatch) {
-                const val = parseFloat(ratingMatch[1]);
-                if (val >= 1 && val <= 5) result.rating = val.toFixed(1);
-            }
-
-            const revMatch = bodyText.match(/([0-9]+(?:\\.[0-9]+)?)\\s*K\\+/);
-            if (revMatch) {
-                result.reviews = Math.round(parseFloat(revMatch[1]) * 1000).toString();
-            } else {
-                const revMatch2 = bodyText.match(/([0-9,]+)\\s*(?:Ratings?\\s*[&+]\\s*)?Reviews?/i);
-                if (revMatch2) result.reviews = revMatch2[1].replace(/,/g, '');
-            }
-
             return result;
         }
     """)
 
-
-# ═══════════════════════════════════════════════════════════════════════
-#  SECTION 5: CSS SELECTOR FALLBACK
-# ═══════════════════════════════════════════════════════════════════════
-
 async def extract_with_css_selectors(page: Page) -> dict:
-    result = {
-        "sellingPrice": None,
-        "originalPrice": None,
-        "discountPercent": None,
-        "rating": None,
-        "reviews": None
-    }
-
-    for field, selectors in FLIPKART_SELECTORS.items():
-        for sel in selectors:
-            try:
-                el = page.locator(sel).first
-                if await el.count() > 0:
-                    text = await el.inner_text()
-                    text = text.strip()
-                    if text:
-                        val = parse_indian_number(re.sub(r'[₹%\s]', '', text))
-                        if val:
-                            if field == "selling_price":
-                                result["sellingPrice"] = val
-                            elif field == "original_price":
-                                result["originalPrice"] = val
-                            elif field == "discount":
-                                result["discountPercent"] = int(val)
-                            elif field == "rating":
-                                if 1 <= val <= 5:
-                                    result["rating"] = f"{val:.1f}"
-                            elif field == "reviews":
-                                result["reviews"] = str(int(val))
-                            break
-            except:
-                continue
-
-    return result
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  SECTION 6: TEXT-BASED FALLBACK
-# ═══════════════════════════════════════════════════════════════════════
-
-async def extract_with_text_parsing(page: Page) -> dict:
-    page_text = await page.inner_text("body")
-
-    result = {
-        "sellingPrice": None,
-        "originalPrice": None,
-        "discountPercent": None,
-        "rating": None,
-        "reviews": None
-    }
-
-    prices = []
-    price_matches = re.findall(r'₹\s*([\d,]+)', page_text)
-    for p in price_matches:
-        val = parse_indian_number(p)
-        if val and val > 500:
-            prices.append(val)
-
-    lines = page_text.split('\n')
-    bad_keywords = ['emi', '/m', 'per month', 'monthly', 'warranty',
-                    'protection', 'insurance', 'case', 'cover']
-    clean_prices = []
-    for i, line in enumerate(lines):
-        lower = line.lower()
-        if any(k in lower for k in bad_keywords):
-            continue
-        line_prices = re.findall(r'₹\s*([\d,]+)', line)
-        for p in line_prices:
-            val = parse_indian_number(p)
-            if val and val > 500:
-                clean_prices.append(val)
-
-    unique = sorted(set(clean_prices))
-    if len(unique) >= 2:
-        result["sellingPrice"] = unique[0]
-        result["originalPrice"] = unique[-1]
-    elif len(unique) == 1:
-        result["sellingPrice"] = unique[0]
-
-    disc_match = re.search(r'(\d{1,2})\s*%\s*off', page_text, re.IGNORECASE)
-    if disc_match:
-        result["discountPercent"] = int(disc_match.group(1))
-
-    rating_match = re.search(r'(\d\.\d)\s*★', page_text)
-    if rating_match:
-        val = float(rating_match.group(1))
-        if 1 <= val <= 5:
-            result["rating"] = f"{val:.1f}"
-
-    rev_match = re.search(r'(\d+\.?\d*)\s*K\+', page_text)
-    if rev_match:
-        result["reviews"] = str(int(float(rev_match.group(1)) * 1000))
-    else:
-        rev_match2 = re.search(r'([\d,]+)\s*(?:Ratings?\s*[&+]\s*)?Reviews?', page_text, re.IGNORECASE)
-        if rev_match2:
-            result["reviews"] = rev_match2.group(1).replace(',', '')
-
-    return result
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  SECTION 6B: CAPTCHA / BLOCK DETECTION
-# ═══════════════════════════════════════════════════════════════════════
-
-async def is_captcha_or_blocked(page: Page) -> bool:
-    try:
-        current_url = page.url
-        page_title = await page.title()
-        body_text = await page.inner_text("body")
-
-        block_url_keywords = ["captcha", "robot", "challenge", "security", "blocked", "verify"]
-        for kw in block_url_keywords:
-            if kw in current_url.lower():
-                log.warning(f"  🤖 CAPTCHA/BLOCK detected via URL: {current_url[:80]}")
-                return True
-
-        block_title_keywords = ["attention required", "just a moment", "access denied",
-                                 "bot", "security check", "captcha", "403"]
-        for kw in block_title_keywords:
-            if kw in page_title.lower():
-                log.warning(f"  🤖 CAPTCHA/BLOCK detected via title: '{page_title}'")
-                return True
-
-        block_content_keywords = [
-            "please verify you are a human",
-            "enable javascript and cookies",
-            "security check to access",
-            "your browser does not support",
-            "access to this page has been denied",
-            "checking your browser",
-            "cf-browser-verification"
-        ]
-        body_lower = body_text.lower()
-        for kw in block_content_keywords:
-            if kw in body_lower:
-                log.warning(f"  🤖 CAPTCHA/BLOCK detected via content: '{kw}'")
-                return True
-
-        if len(body_text.strip()) < 200:
-            log.warning(f"  ⚠️ Page too short ({len(body_text)} chars) - possibly blocked")
-            return True
-
-        return False
-    except Exception as e:
-        log.warning(f"  ⚠️ Captcha check failed: {e}")
-        return False
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  SECTION 7: MASTER EXTRACTION - Try all 3 methods
-# ═══════════════════════════════════════════════════════════════════════
-
-async def extract_product_data(page: Page, url: str, browser: Browser) -> dict:
-    log.info(f"  🌐 Opening: {url[:80]}...")
-    referer_pool = [
-        "https://www.google.com/",
-        "https://www.bing.com/",
-        "https://duckduckgo.com/",
-        "https://in.search.yahoo.com/"
-    ]
-
-    for scrape_attempt in range(1, MAX_SCRAPE_RETRIES + 1):
+    result = {"sellingPrice": None, "originalPrice": None}
+    sell_sels = ["div._30jeq3._16Jk6d", "div.Nx9bqj", "div._30jeq3"]
+    mrp_sels = ["div._3I9_wc._2p6lqe", "div.yRaY8j", "div._3I9_wc"]
+    
+    for sel in sell_sels:
         try:
-            if scrape_attempt > 1:
-                log.info(f"  🔄 Scrape retry {scrape_attempt}/{MAX_SCRAPE_RETRIES} with fresh stealth context...")
-                await asyncio.sleep(random.uniform(8.0, 15.0))
-                fresh_context = await create_stealth_context(browser)
-                page = await fresh_context.new_page()
-                await stealth_async(page)
+            el = page.locator(sel).first
+            if await el.count() > 0:
+                text = await el.inner_text()
+                result["sellingPrice"] = int(re.sub(r'[^0-9]', '', text))
+                break
+        except: pass
+        
+    for sel in mrp_sels:
+        try:
+            el = page.locator(sel).first
+            if await el.count() > 0:
+                text = await el.inner_text()
+                result["originalPrice"] = int(re.sub(r'[^0-9]', '', text))
+                break
+        except: pass
+        
+    return result
 
-            nav_success = False
-            for wait_strategy in ["domcontentloaded", "load"]:
+
+# ═══════════════════════════════════════════════════════════════════════
+#  SECTION 4: MASTER EXTRACTION WITH 404 & CANCELLATION PROTECTION
+# ═══════════════════════════════════════════════════════════════════════
+
+async def extract_product_data(page: Page, url: str) -> dict:
+    log.info(f"  🌐 Opening: {url[:80]}...")
+    
+    # FIX 2: ROBUST NAVIGATION TRY-CATCH
+    nav_success = False
+    for wait_strategy in ["domcontentloaded", "load"]:
+        try:
+            response = await page.goto(
+                url, 
+                referer="https://www.google.com/", 
+                wait_until=wait_strategy, 
+                timeout=PAGE_LOAD_TIMEOUT
+            )
+            
+            # Check for 404 Not Found Page Deleted
+            if response and response.status in [404, 410]:
+                log.error(f"  ❌ Page not found (404 Error) on Flipkart. Skipping.")
+                return {}
+                
+            nav_success = True
+            break
+        except Exception as nav_err:
+            err_msg = str(nav_err).lower()
+            if "timeout" in err_msg or "cancel" in err_msg or "abort" in err_msg:
+                log.warning(f"  ⏰ Nav error '{wait_strategy}': {err_msg[:40]}. Checking if page loaded anyway...")
                 try:
-                    log.info(f"  ⏳ Navigation strategy: '{wait_strategy}'")
-                    await page.goto(
-                        url, 
-                        referer=random.choice(referer_pool), 
-                        wait_until=wait_strategy, 
-                        timeout=PAGE_LOAD_TIMEOUT
-                    )
-                    nav_success = True
-                    break
-                except Exception as nav_err:
-                    if "timeout" in str(nav_err).lower():
-                        log.warning(f"  ⏰ Navigation timeout with '{wait_strategy}', trying next strategy...")
-                        try:
-                            body_check = await page.inner_text("body")
-                            if len(body_check) > 500:
-                                log.info(f"  ⚡ Page partially loaded ({len(body_check)} chars), proceeding...")
-                                nav_success = True
-                                break
-                        except:
-                            pass
-                    else:
-                        raise nav_err
+                    # Check if body is there despite the error
+                    body_text = await page.inner_text("body")
+                    if len(body_text) > 500:
+                        nav_success = True
+                        break
+                except:
+                    pass
 
-            if not nav_success:
-                log.error(f"  ❌ All navigation strategies failed for: {url[:60]}")
-                continue
+    if not nav_success:
+        log.error(f"  ❌ All navigation failed (Operation Canceled/Timeout). Skipping.")
+        return {}
 
-            await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+    await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
-            current_url = page.url
-            if "login" in current_url or "error" in current_url.lower():
-                log.warning(f"  ⚠️ Redirected to: {current_url[:60]}")
-                return {}
+    data = {}
+    for attempt in range(1, 4):
+        await page.evaluate("window.scrollBy(0, 500)")
+        await asyncio.sleep(1)
 
-            if "this page doesn't exist" in (await page.title()).lower() or \
-               "page not found" in (await page.title()).lower():
-                log.error(f"  ❌ 404 Page Not Found: {url[:60]}")
-                return {}
+        # 1. Try DOM Strikethrough
+        data = await extract_with_dom_strikethrough(page)
+        if data.get("sellingPrice"): break
 
-            if await is_captcha_or_blocked(page):
-                log.warning(f"  🤖 Bot block detected! Will retry with fresh context...")
-                if scrape_attempt < MAX_SCRAPE_RETRIES:
-                    await asyncio.sleep(random.uniform(15.0, 25.0))
-                    continue
-                else:
-                    log.error(f"  ❌ Still blocked after {MAX_SCRAPE_RETRIES} attempts. Giving up.")
-                    return {}
+        # 2. Try CSS Selectors
+        css_data = await extract_with_css_selectors(page)
+        if css_data.get("sellingPrice"):
+            data = css_data
+            break
 
-            data = {}
-            method = ""
+        await asyncio.sleep(2)
 
-            for attempt in range(1, 16):
-                await human_scroll(page)
-                await asyncio.sleep(random.uniform(1.0, 2.0))
-
-                data_try = await extract_with_dom_strikethrough(page)
-                if data_try.get("sellingPrice"):
-                    data = data_try
-                    method = "DOM_strikethrough"
-                    break
-
-                css_data = await extract_with_css_selectors(page)
-                if css_data.get("sellingPrice"):
-                    data["sellingPrice"] = css_data["sellingPrice"]
-                    if css_data.get("originalPrice"):
-                        data["originalPrice"] = css_data["originalPrice"]
-                    data.update({k: v for k, v in css_data.items() if v and not data.get(k)})
-                    method = "CSS_selectors"
-                    break
-
-                text_data = await extract_with_text_parsing(page)
-                if text_data.get("sellingPrice"):
-                    data = text_data
-                    method = "text_parsing"
-                    break
-
-                log.warning(f"  ⏳ Attempt {attempt}/15: Price not found yet, retrying & waiting...")
-                await asyncio.sleep(random.uniform(2.0, 4.0))
-
-            if data.get("sellingPrice"):
-                log.info(f"  ✅ Right | [{method}] ₹{int(data['sellingPrice']):,} | "
-                         f"MRP:₹{int(data['originalPrice'] or 0):,} | "
-                         f"Disc:{data.get('discountPercent') or 'N/A'}% | "
-                         f"⭐{data.get('rating') or 'N/A'} | "
-                         f"Rev:{data.get('reviews') or 'N/A'}")
-                return data
-            else:
-                log.error(f"  ❌ Failed to extract data even after maximum attempts!")
-                return {}
-
-        except Exception as e:
-            err_str = str(e).lower()
-            if "timeout" in err_str or "timed out" in err_str:
-                log.warning(f"  ⏰ ReadTimeoutError on attempt {scrape_attempt}: {e}")
-                if scrape_attempt < MAX_SCRAPE_RETRIES:
-                    log.info(f"  🔄 Will retry with fresh context...")
-                    continue
-                else:
-                    log.error(f"  ❌ Timeout after {MAX_SCRAPE_RETRIES} retries. Skipping.")
-                    return {}
-            else:
-                log.error(f"  ❌ Scrape failed: {e}")
-                return {}
-
-    return {}
+    if data.get("sellingPrice"):
+        log.info(f"  ✅ Extracted: ₹{data['sellingPrice']} | MRP: ₹{data.get('originalPrice') or 0}")
+        return data
+    else:
+        log.error(f"  ❌ Failed to extract price data.")
+        return {}
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  SECTION 8: HUMAN-LIKE BEHAVIOR
+#  SECTION 5: HUMAN-LIKE BEHAVIOR & BROWSER SETUP
 # ═══════════════════════════════════════════════════════════════════════
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.86 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
-]
-
-VIEWPORTS = [
-    {"width": 1366, "height": 768},
-    {"width": 1440, "height": 900},
-    {"width": 1920, "height": 1080},
-    {"width": 1280, "height": 800},
-]
-
-async def human_scroll(page: Page):
-    try:
-        scroll_height = await page.evaluate("document.body.scrollHeight")
-        current = 0
-        while current < min(scroll_height * 0.6, 2000):
-            scroll_amount = random.randint(100, 300)
-            current += scroll_amount
-            await page.evaluate(f"window.scrollBy(0, {scroll_amount})")
-            await asyncio.sleep(random.uniform(0.1, 0.4))
-    except:
-        pass
-
-async def human_mouse_move(page: Page):
-    try:
-        viewport = page.viewport_size or {"width": 1366, "height": 768}
-        for _ in range(random.randint(2, 5)):
-            x = random.randint(100, viewport["width"] - 100)
-            y = random.randint(100, viewport["height"] - 100)
-            await page.mouse.move(x, y)
-            await asyncio.sleep(random.uniform(0.1, 0.3))
-    except:
-        pass
-
-async def setup_browser(playwright):
-    return await playwright.chromium.launch(
-        headless=HEADLESS,
-        args=[
-            "--no-sandbox",
-            "--disable-blink-features=AutomationControlled",
-            "--disable-infobars",
-            "--disable-extensions",
-            "--disable-dev-shm-usage",
-            "--disable-features=VizDisplayCompositor",
-            "--disable-ipc-flooding-protection",
-            "--disable-renderer-backgrounding",
-            "--disable-backgrounding-occluded-windows",
-        ]
-    )
 
 async def create_stealth_context(browser: Browser) -> BrowserContext:
-    ua = random.choice(USER_AGENTS)
-    vp = random.choice(VIEWPORTS)
     context = await browser.new_context(
-        user_agent=ua,
-        viewport=vp,
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        viewport={"width": 1366, "height": 768},
         locale="en-IN",
-        timezone_id="Asia/Kolkata",
-        extra_http_headers={
-            "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Cache-Control": "max-age=0",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-            "Upgrade-Insecure-Requests": "1",
-        }
+        extra_http_headers={"Accept-Language": "en-IN,en;q=0.9"}
     )
     
-    # Adding original JS evasions just to be extra safe along with stealth_async
+    # MANUAL EVASIONS (Will save us if stealth_async fails)
     await context.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-IN', 'en', 'hi'] });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
         window.chrome = { runtime: {} };
-        Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-        Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-        Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-        Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters) => (
-            parameters.name === 'notifications'
-                ? Promise.resolve({ state: Notification.permission })
-                : originalQuery(parameters)
-        );
-        const getContext = HTMLCanvasElement.prototype.getContext;
-        HTMLCanvasElement.prototype.getContext = function(type, ...args) {
-            const ctx = getContext.call(this, type, ...args);
-            if (ctx && type === '2d') {
-                const originalFillText = ctx.fillText.bind(ctx);
-                ctx.fillText = function(...fargs) {
-                    return originalFillText(...fargs);
-                };
-            }
-            return ctx;
-        };
     """)
     return context
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  SECTION 9: BUILD SUPABASE UPDATE
-# ═══════════════════════════════════════════════════════════════════════
-
-def get_dict_value_ignore_case(d: dict, target_keys: list) -> str:
-    target_keys_lower = [k.lower() for k in target_keys]
-    for key, value in d.items():
-        if key.lower() in target_keys_lower and value:
-            return str(value)
-    return ""
-
-def find_real_column_name(all_cols: list, candidates: list) -> Optional[str]:
-    candidates_lower = [c.lower() for c in candidates]
-    for col in all_cols:
-        if col.lower() in candidates_lower:
-            return col
-    return None
-
-def build_update_payload(product: dict, extracted: dict, all_cols: list) -> Tuple[dict, dict]:
-    selling_num = extracted.get("sellingPrice") or 0
-    original_num = extracted.get("originalPrice") or 0
-    extracted_discount = extracted.get("discountPercent") or 0
-
-    validated = validate_prices(selling_num, original_num)
-
-    if 1 <= extracted_discount <= 90 and validated["valid_original"] > 0:
-        validated["discount_str"] = f"{extracted_discount}% off"
-        validated["discount_pct"] = extracted_discount
-
-    u = {}
-
-    price_candidates = ["Price", "Current Price", "price", "current_price", "discounted_price"]
-    mrp_candidates = ["Original Price", "Original Price-2", "original_price", "mrp"]
-    discount_candidates = ["Discount", "discount", "discount_percent"]
-    rating_candidates = ["Rating", "rating", "Ratings and Reviews", "Rating and Reviews"]
-    reviews_candidates = ["Number of Reviews", "Reviews", "reviews", "review_count"]
-
-    price_col = find_real_column_name(all_cols, price_candidates)
-    mrp_col = find_real_column_name(all_cols, mrp_candidates)
-    discount_col = find_real_column_name(all_cols, discount_candidates)
-    rating_col = find_real_column_name(all_cols, rating_candidates)
-    reviews_col = find_real_column_name(all_cols, reviews_candidates)
-
-    if price_col and validated["final_selling"] > 0:
-        u[price_col] = f"₹{int(validated['final_selling']):,}"
-    if mrp_col and validated["valid_original"] > 0:
-        u[mrp_col] = f"₹{int(validated['valid_original']):,}"
-    if discount_col and validated["discount_str"]:
-        u[discount_col] = validated["discount_str"]
-    if rating_col and extracted.get("rating"):
-        u[rating_col] = extracted["rating"]
-    if reviews_col and extracted.get("reviews"):
-        u[reviews_col] = extracted["reviews"]
-
-    return u, validated
-
-
-# ═══════════════════════════════════════════════════════════════════════
-#  SECTION 10: MINI AGENT RUNNER
+#  SECTION 6: MINI AGENT RUNNER
 # ═══════════════════════════════════════════════════════════════════════
 
 async def run_mini_agent(agent_config: dict, sb: Client, browser: Browser):
-    agent_id = agent_config["id"]
-    agent_name = agent_config["name"]
     table = agent_config["table"]
-    label = f"Agent-{agent_id:02d} [{agent_name.upper()}]"
-
-    log.info(f"\n{'='*60}")
-    log.info(f"  {label} STARTING {'(TEST MODE - 20 items)' if TEST_MODE else ''}")
-    log.info(f"{'='*60}")
+    label = f"Agent-[{agent_config['name'].upper()}]"
 
     products = fetch_category_products(sb, table, limit=10)
-    if not products:
-        log.warning(f"  [{label}] No products found")
-        return {"agent": label, "updated": 0, "failed": 0, "total": 0}
+    if not products: return
 
     context = await create_stealth_context(browser)
     page = await context.new_page()
-    await stealth_async(page)  # Enforcing playwright-stealth
+    
+    # APPLY STEALTH ONLY IF AVAILABLE
+    if STEALTH_AVAILABLE and stealth_async:
+        try:
+            await stealth_async(page)
+        except Exception as e:
+            log.warning(f"  ⚠️ Stealth apply failed: {e}")
 
     updated = 0
-    failed = 0
-    url_recovered = 0
-
     for i, product in enumerate(products, 1):
         product_id = product.get("id")
+        name = product.get("Product Name-2") or product.get("name") or "Unknown"
+        log.info(f"\n  [{label}] ({i}/{len(products)}) {name[:50]}...")
 
-        product_name = get_dict_value_ignore_case(
-            product, ["Product Name-2", "Product Name", "name", "Brand Name"]
-        )
-        if not product_name:
-            product_name = "Unknown"
-
-        log.info(f"\n  [{label}] ({i}/{len(products)}) {product_name[:50]}...")
-
-        # ── TRUNCATED URL FIX: Resolve URL before scraping ──
         url = await resolve_product_url(page, product, sb, table, product_id)
+        if not url: continue
 
-        if not url:
-            log.warning(f"  [{label}] No valid URL available. Skipping.")
-            failed += 1
-            continue
+        extracted = await extract_product_data(page, url)
+        if not extracted or not extracted.get("sellingPrice"): continue
 
-        if not url or "flipkart.com" not in url:
-            log.warning(f"  [{label}] Not a Flipkart URL. Skipping.")
-            failed += 1
-            continue
+        # Simple DB Update Payload
+        u = {}
+        selling = extracted["sellingPrice"]
+        original = extracted.get("originalPrice") or 0
+        
+        for k in product.keys():
+            kl = k.lower()
+            if kl in ["price", "current price"]: u[k] = f"₹{selling:,}"
+            if kl in ["original price", "mrp"] and original > 0: u[k] = f"₹{original:,}"
 
-        await human_mouse_move(page)
-
-        extracted = await extract_product_data(page, url, browser)
-
-        if not extracted or not extracted.get("sellingPrice"):
-            log.warning(f"  [{label}] No price extracted, skipping")
-            failed += 1
-            continue
-
-        all_cols = list(product.keys())
-        update_data, validated = build_update_payload(product, extracted, all_cols)
-
-        if not update_data:
-            log.warning(f"  [{label}] No columns to update")
-            failed += 1
-            continue
-
-        success = update_product(sb, table, product_id, update_data)
-
-        if success:
-            updated += 1
-            log.info(f"  [{label}] ✅ Right! Updated DB: "
-                     f"₹{int(validated['final_selling']):,} | "
-                     f"MRP:₹{int(validated['valid_original'] or 0):,} | "
-                     f"{validated['discount_str'] or 'No discount'}")
-        else:
-            failed += 1
-
-        if i < len(products):
-            delay = random.uniform(4.0, 8.0)
-            log.info(f"  [{label}] ⏳ Waiting {delay:.1f}s...")
-            await asyncio.sleep(delay)
+        if u:
+            if update_product(sb, table, product_id, u):
+                updated += 1
+                log.info(f"  💾 Saved to DB: {u}")
+                
+        await asyncio.sleep(random.uniform(3.0, 5.0))
 
     await context.close()
-
-    log.info(f"\n  [{label}] ✅ DONE: {updated} updated, {failed} failed, {len(products)} total")
-    return {"agent": label, "updated": updated, "failed": failed, "total": len(products)}
+    log.info(f"  ✅ DONE: {updated} updated out of {len(products)}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1049,54 +429,22 @@ async def run_mini_agent(agent_config: dict, sb: Client, browser: Browser):
 
 async def main():
     log.info("╔══════════════════════════════════════════════════════════════╗")
-    if TEST_MODE:
-        log.info("║  PRICEYAAR SUPER AGENT v8.0 - FULL ANTI-BOT EDITION        ║")
-        log.info("║  🎯 TARGET: earbuds table (20 products)                     ║")
-    else:
-        log.info("║  PRICEYAAR SUPER AGENT v8.0 - FULL MODE (All 10 Agents)    ║")
-    log.info("║  Python + Playwright Stealth + DOM + Auto-Installer           ║")
+    log.info("║  PRICEYAAR SUPER AGENT v8.1 - GITHUB ACTIONS SAFE EDITION  ║")
     log.info("╚══════════════════════════════════════════════════════════════╝")
-    log.info(f"  Active agents: {[a['name'] for a in AGENTS]}")
-    log.info(f"  Batch size: {TEST_BATCH_SIZE if TEST_MODE else 10} products per agent")
 
     sb = get_supabase()
-    log.info(f"✅ Supabase connected to: {SUPABASE_URL[:40]}...")
-
-    async with async_playwright() as playwright:
-        browser = await setup_browser(playwright)
-        log.info(f"🌐 Browser launched (headless={HEADLESS})")
-
-        results = []
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=HEADLESS,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"]
+        )
+        
         for agent in AGENTS:
-            result = await run_mini_agent(agent, sb, browser)
-            results.append(result)
-
-            if agent["id"] < len(ALL_AGENTS) and not TEST_MODE:
-                rest = random.uniform(5.0, 10.0)
-                log.info(f"\n💤 Resting {rest:.0f}s before next agent...")
-                await asyncio.sleep(rest)
+            await run_mini_agent(agent, sb, browser)
 
         await browser.close()
-
-    log.info(f"\n{'='*60}")
-    log.info("  FINAL REPORT")
-    log.info(f"{'='*60}")
-    total_updated = 0
-    total_failed = 0
-    total_products = 0
-    for r in results:
-        log.info(f"  {r['agent']}: {r['updated']} updated | {r['failed']} failed | {r['total']} total")
-        total_updated += r["updated"]
-        total_failed += r["failed"]
-        total_products += r["total"]
-    log.info(f"{'='*60}")
-    log.info(f"  TOTAL: {total_updated} updated | {total_failed} failed | {total_products} products")
-    log.info(f"{'='*60}")
-    if TEST_MODE:
-        log.info("🏁 TEST MODE complete! Set TEST_MODE = False to run all 10 agents.")
-    else:
-        log.info("🏁 All 10 agents finished!")
-
+    log.info("🏁 ALL TASKS FINISHED!")
 
 if __name__ == "__main__":
     asyncio.run(main())
+
