@@ -123,6 +123,7 @@ def get_supabase() -> Client:
 def fetch_category_products(sb: Client, table: str, limit: int = 10) -> List[Dict]:
     """
     Fetch products from Supabase.
+    FIXED: Using List[Dict] instead of list[dict] for compatibility.
     """
     actual_limit = TEST_BATCH_SIZE if TEST_MODE else limit
     try:
@@ -1099,4 +1100,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
