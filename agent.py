@@ -1,42 +1,66 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  PRICEYAAR SUPER AGENT v7.2 - TRUNCATED URL FIX EDITION            ║
-║  Python + Playwright + DOM Strikethrough + EARBUDS ONLY (20 items)  ║
+║  PRICEYAAR SUPER AGENT v8.0 - FULL LENGTH & ANTI-BOT EDITION         ║
+║  Python + Playwright + DOM Strikethrough + EARBUDS ONLY (20 items)   ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
-WHAT'S NEW IN v7.2:
-- TRUNCATED URL FIX: Detects incomplete URLs from Supabase
-- FLIPKART SEARCH FALLBACK: If URL is bad → search by product name → get real URL
-- AUTO DB UPDATE: Saves the corrected URL back to Supabase
-- All original logic intact: DOM strikethrough, CSS fallback, text parsing
-
-EXTRACTION LOGIC:
-1. ₹ symbol = price indicator
-2. text-decoration: line-through = ORIGINAL PRICE (MRP)
-3. Normal ₹ without strikethrough = SELLING PRICE
-4. XX% off = DISCOUNT PERCENT (1-99 max)
-5. X.X ★ = STAR RATING (1.0-5.0)
-6. XX.XK+ = REVIEWS COUNT
-
-VALIDATION RULES:
-- Original > Selling (MRP must be higher)
-- Ratio: 1.05x to 3x (not 10x!)
-- Discount: 1% to 90% (>90% = fake, reject)
-- If validation fails → save ONLY selling price
+WHAT'S NEW IN v8.0:
+- AUTO-INSTALLER: Installs required packages (playwright, stealth, supabase) automatically.
+- TRUNCATED URL FIX: Detects incomplete URLs from Supabase.
+- FLIPKART SEARCH FALLBACK: If URL is bad → search by product name → get real URL.
+- AUTO DB UPDATE: Saves the corrected URL back to Supabase.
+- PLAYWRIGHT STEALTH & HUMAN BEHAVIOR: Mouse movements, delays, and referers.
+- All original logic intact: DOM strikethrough, CSS fallback, text parsing.
 """
 
+# ═══════════════════════════════════════════════════════════════════════
+#  SECTION 0: AUTO-INSTALL DEPENDENCIES
+# ═══════════════════════════════════════════════════════════════════════
+import sys
+import subprocess
+import os
+
+def ensure_dependencies():
+    """Automatically installs required pip packages and Playwright browsers if not found."""
+    try:
+        reqs = subprocess.check_output([sys.executable, '-m', 'pip', 'freeze']).decode('utf-8').lower()
+    except Exception as e:
+        print(f"Error checking pip freeze: {e}")
+        reqs = ""
+
+    packages = {
+        'playwright': 'playwright',
+        'playwright-stealth': 'playwright-stealth',
+        'supabase': 'supabase'
+    }
+
+    for pkg_name, pip_name in packages.items():
+        if pkg_name not in reqs:
+            print(f"[*] Installing missing package: {pip_name}...")
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', pip_name, '--quiet'])
+    
+    print("[*] Ensuring Playwright browsers are installed...")
+    try:
+        subprocess.check_call([sys.executable, '-m', 'playwright', 'install', 'chromium'])
+    except Exception as e:
+        pass 
+
+ensure_dependencies()
+
+# ─────────────────────────────────────────────
+#  STANDARD IMPORTS
+# ─────────────────────────────────────────────
 import asyncio
 import json
 import re
 import random
-import os
 import logging
-import sys
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple
 
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext
+from playwright_stealth import stealth_async
 from supabase import create_client, Client
 
 
@@ -99,9 +123,6 @@ def get_supabase() -> Client:
 def fetch_category_products(sb: Client, table: str, limit: int = 10) -> list[dict]:
     """
     Fetch products from Supabase.
-    NOTE: Supabase API always returns full raw strings.
-    The '...' truncation is only a Supabase Dashboard UI display issue.
-    This function fetches the complete data correctly.
     """
     actual_limit = TEST_BATCH_SIZE if TEST_MODE else limit
     try:
@@ -124,7 +145,6 @@ def update_product(sb: Client, table: str, product_id, data: dict):
 def update_product_url(sb: Client, table: str, product_id, url_col: str, new_url: str) -> bool:
     """
     Save the corrected (recovered) Flipkart URL back to Supabase.
-    Called when a truncated URL is fixed via Flipkart search.
     """
     try:
         sb.table(table).update({url_col: new_url}).eq("id", product_id).execute()
@@ -188,50 +208,31 @@ def parse_indian_number(s: str) -> Optional[float]:
 # ═══════════════════════════════════════════════════════════════════════
 
 def is_url_truncated(url: str) -> bool:
-    """
-    Check if a Flipkart URL is truncated or invalid.
-
-    A valid Flipkart product URL looks like:
-    https://www.flipkart.com/product-name/p/itm[alphanumeric]?pid=...
-
-    Signs of a truncated/bad URL:
-    - Ends with '...' or '-...' (dashboard display artifact)
-    - Too short to be a real product page
-    - Missing '/p/' segment (product page identifier)
-    - Contains spaces or non-URL characters
-    - Does not start with http
-    """
     if not url:
         return True
 
     url = url.strip()
 
-    # Ends with ellipsis
     if url.endswith("...") or url.endswith("-...") or url.endswith("…"):
         log.warning(f"  ⚠️ URL ends with ellipsis (truncated): {url}")
         return True
 
-    # Too short
     if len(url) < MIN_URL_LENGTH:
         log.warning(f"  ⚠️ URL too short ({len(url)} chars): {url}")
         return True
 
-    # Not a real URL
     if not url.startswith("http"):
         log.warning(f"  ⚠️ URL does not start with http: {url}")
         return True
 
-    # Not a Flipkart domain
     if "flipkart.com" not in url:
         log.warning(f"  ⚠️ Not a Flipkart URL: {url}")
         return True
 
-    # Missing product page segment '/p/'
     if "/p/" not in url:
         log.warning(f"  ⚠️ URL missing '/p/' segment (not a product page): {url}")
         return True
 
-    # Contains spaces (broken URL)
     if " " in url:
         log.warning(f"  ⚠️ URL contains spaces: {url}")
         return True
@@ -240,16 +241,6 @@ def is_url_truncated(url: str) -> bool:
 
 
 async def search_flipkart_for_url(page: Page, product_name: str) -> Optional[str]:
-    """
-    When a product URL is truncated or invalid, search Flipkart by
-    product name and return the first real product URL found.
-
-    Flow:
-    1. Go to flipkart.com/search?q={product_name}
-    2. Wait for search results to load
-    3. Find the first product card link
-    4. Return the full product URL
-    """
     if not product_name or product_name == "Unknown":
         log.error("  ❌ Cannot search Flipkart: product name is empty or Unknown")
         return None
@@ -260,15 +251,14 @@ async def search_flipkart_for_url(page: Page, product_name: str) -> Optional[str
     log.info(f"  🔍 Search URL: {search_url}")
 
     try:
-        await page.goto(search_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
-        await asyncio.sleep(random.uniform(2.5, 4.0))
+        # Applying Google referer to bypass bot detection on search
+        await page.goto(search_url, referer="https://www.google.com/", wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+        await asyncio.sleep(random.uniform(2.5, 5.0))
 
-        # Check if blocked
         if await is_captcha_or_blocked(page):
             log.warning("  🤖 Bot block on search page. Cannot recover URL.")
             return None
 
-        # Try multiple selectors to find first product link
         product_link_selectors = [
             "a[href*='/p/itm']",
             "a._1fQZEK",
@@ -288,10 +278,8 @@ async def search_flipkart_for_url(page: Page, product_name: str) -> Optional[str
                 if count > 0:
                     href = await links.first.get_attribute("href")
                     if href:
-                        # Build full URL if relative
                         if href.startswith("/"):
                             href = "https://www.flipkart.com" + href
-                        # Validate it looks like a product page
                         if "flipkart.com" in href and "/p/" in href:
                             found_url = href
                             log.info(f"  ✅ Found URL via selector '{sel}': {found_url[:80]}...")
@@ -300,7 +288,6 @@ async def search_flipkart_for_url(page: Page, product_name: str) -> Optional[str
                 continue
 
         if not found_url:
-            # Last resort: scan all <a> tags for product links
             log.warning("  ⚠️ Standard selectors failed, scanning all links...")
             all_hrefs = await page.evaluate("""
                 () => {
@@ -332,16 +319,6 @@ async def resolve_product_url(
     table: str,
     product_id
 ) -> Optional[str]:
-    """
-    Master URL resolver. Returns a valid, full Flipkart URL.
-
-    Steps:
-    1. Read URL from product dict (case-insensitive)
-    2. Check if URL is truncated/invalid
-    3. If bad → search Flipkart by product name
-    4. If found → save corrected URL to DB
-    5. Return the working URL (or None if all fails)
-    """
     url_col_candidates = ["Product Link", "product_url", "link", "Product URL", "url"]
     url = get_dict_value_ignore_case(product, url_col_candidates)
     url_col = find_real_column_name(list(product.keys()), url_col_candidates)
@@ -351,17 +328,14 @@ async def resolve_product_url(
     if is_url_truncated(url):
         log.warning(f"  ⚠️ URL is truncated or invalid. Attempting Flipkart search fallback...")
 
-        # Get product name for search
         product_name = get_dict_value_ignore_case(
             product, ["Product Name-2", "Product Name", "name", "Brand Name"]
         )
 
-        # Search Flipkart to recover URL
         recovered_url = await search_flipkart_for_url(page, product_name)
 
         if recovered_url:
             log.info(f"  🔧 URL recovered: {recovered_url[:80]}...")
-            # Save corrected URL to DB
             if url_col and product_id:
                 update_product_url(sb, table, product_id, url_col, recovered_url)
             return recovered_url
@@ -683,20 +657,32 @@ async def is_captcha_or_blocked(page: Page) -> bool:
 
 async def extract_product_data(page: Page, url: str, browser: Browser) -> dict:
     log.info(f"  🌐 Opening: {url[:80]}...")
+    referer_pool = [
+        "https://www.google.com/",
+        "https://www.bing.com/",
+        "https://duckduckgo.com/",
+        "https://in.search.yahoo.com/"
+    ]
 
     for scrape_attempt in range(1, MAX_SCRAPE_RETRIES + 1):
         try:
             if scrape_attempt > 1:
-                log.info(f"  🔄 Scrape retry {scrape_attempt}/{MAX_SCRAPE_RETRIES} with fresh context...")
+                log.info(f"  🔄 Scrape retry {scrape_attempt}/{MAX_SCRAPE_RETRIES} with fresh stealth context...")
                 await asyncio.sleep(random.uniform(8.0, 15.0))
                 fresh_context = await create_stealth_context(browser)
                 page = await fresh_context.new_page()
+                await stealth_async(page)
 
             nav_success = False
             for wait_strategy in ["domcontentloaded", "load"]:
                 try:
-                    log.info(f"  ⏳ Navigation strategy: '{wait_strategy}' (timeout={PAGE_LOAD_TIMEOUT//1000}s)")
-                    await page.goto(url, wait_until=wait_strategy, timeout=PAGE_LOAD_TIMEOUT)
+                    log.info(f"  ⏳ Navigation strategy: '{wait_strategy}'")
+                    await page.goto(
+                        url, 
+                        referer=random.choice(referer_pool), 
+                        wait_until=wait_strategy, 
+                        timeout=PAGE_LOAD_TIMEOUT
+                    )
                     nav_success = True
                     break
                 except Exception as nav_err:
@@ -717,14 +703,13 @@ async def extract_product_data(page: Page, url: str, browser: Browser) -> dict:
                 log.error(f"  ❌ All navigation strategies failed for: {url[:60]}")
                 continue
 
-            await asyncio.sleep(random.uniform(2.5, 4.5))
+            await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
             current_url = page.url
             if "login" in current_url or "error" in current_url.lower():
                 log.warning(f"  ⚠️ Redirected to: {current_url[:60]}")
                 return {}
 
-            # Check for 404
             if "this page doesn't exist" in (await page.title()).lower() or \
                "page not found" in (await page.title()).lower():
                 log.error(f"  ❌ 404 Page Not Found: {url[:60]}")
@@ -820,13 +805,16 @@ VIEWPORTS = [
 ]
 
 async def human_scroll(page: Page):
-    scroll_height = await page.evaluate("document.body.scrollHeight")
-    current = 0
-    while current < min(scroll_height * 0.6, 2000):
-        scroll_amount = random.randint(100, 300)
-        current += scroll_amount
-        await page.evaluate(f"window.scrollBy(0, {scroll_amount})")
-        await asyncio.sleep(random.uniform(0.1, 0.4))
+    try:
+        scroll_height = await page.evaluate("document.body.scrollHeight")
+        current = 0
+        while current < min(scroll_height * 0.6, 2000):
+            scroll_amount = random.randint(100, 300)
+            current += scroll_amount
+            await page.evaluate(f"window.scrollBy(0, {scroll_amount})")
+            await asyncio.sleep(random.uniform(0.1, 0.4))
+    except:
+        pass
 
 async def human_mouse_move(page: Page):
     try:
@@ -875,6 +863,8 @@ async def create_stealth_context(browser: Browser) -> BrowserContext:
             "Upgrade-Insecure-Requests": "1",
         }
     )
+    
+    # Adding original JS evasions just to be extra safe along with stealth_async
     await context.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
@@ -983,6 +973,7 @@ async def run_mini_agent(agent_config: dict, sb: Client, browser: Browser):
 
     context = await create_stealth_context(browser)
     page = await context.new_page()
+    await stealth_async(page)  # Enforcing playwright-stealth
 
     updated = 0
     failed = 0
@@ -1058,11 +1049,11 @@ async def run_mini_agent(agent_config: dict, sb: Client, browser: Browser):
 async def main():
     log.info("╔══════════════════════════════════════════════════════════════╗")
     if TEST_MODE:
-        log.info("║  PRICEYAAR SUPER AGENT v7.2 - TRUNCATED URL FIX EDITION    ║")
+        log.info("║  PRICEYAAR SUPER AGENT v8.0 - FULL ANTI-BOT EDITION        ║")
         log.info("║  🎯 TARGET: earbuds table (20 products)                     ║")
     else:
-        log.info("║  PRICEYAAR SUPER AGENT v7.2 - FULL MODE (All 10 Agents)    ║")
-    log.info("║  Python + Playwright + DOM Strikethrough + URL Recovery       ║")
+        log.info("║  PRICEYAAR SUPER AGENT v8.0 - FULL MODE (All 10 Agents)    ║")
+    log.info("║  Python + Playwright Stealth + DOM + Auto-Installer           ║")
     log.info("╚══════════════════════════════════════════════════════════════╝")
     log.info(f"  Active agents: {[a['name'] for a in AGENTS]}")
     log.info(f"  Batch size: {TEST_BATCH_SIZE if TEST_MODE else 10} products per agent")
