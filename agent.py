@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  PRICEYAAR SUPER AGENT v7.1 - SINGLE AGENT TEST MODE               ║
+║  PRICEYAAR SUPER AGENT v7.2 - TRUNCATED URL FIX EDITION            ║
 ║  Python + Playwright + DOM Strikethrough + EARBUDS ONLY (20 items)  ║
 ╚══════════════════════════════════════════════════════════════════════╝
+
+WHAT'S NEW IN v7.2:
+- TRUNCATED URL FIX: Detects incomplete URLs from Supabase
+- FLIPKART SEARCH FALLBACK: If URL is bad → search by product name → get real URL
+- AUTO DB UPDATE: Saves the corrected URL back to Supabase
+- All original logic intact: DOM strikethrough, CSS fallback, text parsing
 
 EXTRACTION LOGIC:
 1. ₹ symbol = price indicator
@@ -72,6 +78,9 @@ PAGE_LOAD_TIMEOUT = 180000
 NAVIGATION_WAIT = "domcontentloaded"
 MAX_SCRAPE_RETRIES = 3
 
+# Minimum length a valid Flipkart product URL should be
+MIN_URL_LENGTH = 60
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)s  %(message)s",
@@ -88,6 +97,12 @@ def get_supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def fetch_category_products(sb: Client, table: str, limit: int = 10) -> list[dict]:
+    """
+    Fetch products from Supabase.
+    NOTE: Supabase API always returns full raw strings.
+    The '...' truncation is only a Supabase Dashboard UI display issue.
+    This function fetches the complete data correctly.
+    """
     actual_limit = TEST_BATCH_SIZE if TEST_MODE else limit
     try:
         res = sb.table(table).select("*").limit(actual_limit).execute()
@@ -104,6 +119,19 @@ def update_product(sb: Client, table: str, product_id, data: dict):
         return True
     except Exception as e:
         log.error(f"❌ Update error for id={product_id}: {e}")
+        return False
+
+def update_product_url(sb: Client, table: str, product_id, url_col: str, new_url: str) -> bool:
+    """
+    Save the corrected (recovered) Flipkart URL back to Supabase.
+    Called when a truncated URL is fixed via Flipkart search.
+    """
+    try:
+        sb.table(table).update({url_col: new_url}).eq("id", product_id).execute()
+        log.info(f"  💾 Corrected URL saved to DB for id={product_id}")
+        return True
+    except Exception as e:
+        log.error(f"  ❌ URL update failed for id={product_id}: {e}")
         return False
 
 
@@ -153,6 +181,195 @@ def parse_indian_number(s: str) -> Optional[float]:
         return float(s)
     except:
         return None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  SECTION 2B: TRUNCATED URL DETECTION & FLIPKART SEARCH FALLBACK
+# ═══════════════════════════════════════════════════════════════════════
+
+def is_url_truncated(url: str) -> bool:
+    """
+    Check if a Flipkart URL is truncated or invalid.
+
+    A valid Flipkart product URL looks like:
+    https://www.flipkart.com/product-name/p/itm[alphanumeric]?pid=...
+
+    Signs of a truncated/bad URL:
+    - Ends with '...' or '-...' (dashboard display artifact)
+    - Too short to be a real product page
+    - Missing '/p/' segment (product page identifier)
+    - Contains spaces or non-URL characters
+    - Does not start with http
+    """
+    if not url:
+        return True
+
+    url = url.strip()
+
+    # Ends with ellipsis
+    if url.endswith("...") or url.endswith("-...") or url.endswith("…"):
+        log.warning(f"  ⚠️ URL ends with ellipsis (truncated): {url}")
+        return True
+
+    # Too short
+    if len(url) < MIN_URL_LENGTH:
+        log.warning(f"  ⚠️ URL too short ({len(url)} chars): {url}")
+        return True
+
+    # Not a real URL
+    if not url.startswith("http"):
+        log.warning(f"  ⚠️ URL does not start with http: {url}")
+        return True
+
+    # Not a Flipkart domain
+    if "flipkart.com" not in url:
+        log.warning(f"  ⚠️ Not a Flipkart URL: {url}")
+        return True
+
+    # Missing product page segment '/p/'
+    if "/p/" not in url:
+        log.warning(f"  ⚠️ URL missing '/p/' segment (not a product page): {url}")
+        return True
+
+    # Contains spaces (broken URL)
+    if " " in url:
+        log.warning(f"  ⚠️ URL contains spaces: {url}")
+        return True
+
+    return False
+
+
+async def search_flipkart_for_url(page: Page, product_name: str) -> Optional[str]:
+    """
+    When a product URL is truncated or invalid, search Flipkart by
+    product name and return the first real product URL found.
+
+    Flow:
+    1. Go to flipkart.com/search?q={product_name}
+    2. Wait for search results to load
+    3. Find the first product card link
+    4. Return the full product URL
+    """
+    if not product_name or product_name == "Unknown":
+        log.error("  ❌ Cannot search Flipkart: product name is empty or Unknown")
+        return None
+
+    search_query = product_name.strip().replace(" ", "+")
+    search_url = f"https://www.flipkart.com/search?q={search_query}"
+    log.info(f"  🔍 Searching Flipkart for: '{product_name}'")
+    log.info(f"  🔍 Search URL: {search_url}")
+
+    try:
+        await page.goto(search_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+        await asyncio.sleep(random.uniform(2.5, 4.0))
+
+        # Check if blocked
+        if await is_captcha_or_blocked(page):
+            log.warning("  🤖 Bot block on search page. Cannot recover URL.")
+            return None
+
+        # Try multiple selectors to find first product link
+        product_link_selectors = [
+            "a[href*='/p/itm']",
+            "a._1fQZEK",
+            "a.s1Q9rs",
+            "a._2rpwqI",
+            "div._1AtVbE a",
+            "div._13oc-S a",
+            "div.CXW8mj a",
+            "a[data-id]",
+        ]
+
+        found_url = None
+        for sel in product_link_selectors:
+            try:
+                links = page.locator(sel)
+                count = await links.count()
+                if count > 0:
+                    href = await links.first.get_attribute("href")
+                    if href:
+                        # Build full URL if relative
+                        if href.startswith("/"):
+                            href = "https://www.flipkart.com" + href
+                        # Validate it looks like a product page
+                        if "flipkart.com" in href and "/p/" in href:
+                            found_url = href
+                            log.info(f"  ✅ Found URL via selector '{sel}': {found_url[:80]}...")
+                            break
+            except:
+                continue
+
+        if not found_url:
+            # Last resort: scan all <a> tags for product links
+            log.warning("  ⚠️ Standard selectors failed, scanning all links...")
+            all_hrefs = await page.evaluate("""
+                () => {
+                    const links = Array.from(document.querySelectorAll('a[href]'));
+                    return links
+                        .map(a => a.href)
+                        .filter(h => h.includes('/p/itm') || h.includes('/p/ITM'));
+                }
+            """)
+            if all_hrefs:
+                found_url = all_hrefs[0]
+                log.info(f"  ✅ Found URL via full scan: {found_url[:80]}...")
+
+        if found_url:
+            return found_url
+        else:
+            log.error(f"  ❌ No product URL found on search page for: '{product_name}'")
+            return None
+
+    except Exception as e:
+        log.error(f"  ❌ Flipkart search failed for '{product_name}': {e}")
+        return None
+
+
+async def resolve_product_url(
+    page: Page,
+    product: dict,
+    sb: Client,
+    table: str,
+    product_id
+) -> Optional[str]:
+    """
+    Master URL resolver. Returns a valid, full Flipkart URL.
+
+    Steps:
+    1. Read URL from product dict (case-insensitive)
+    2. Check if URL is truncated/invalid
+    3. If bad → search Flipkart by product name
+    4. If found → save corrected URL to DB
+    5. Return the working URL (or None if all fails)
+    """
+    url_col_candidates = ["Product Link", "product_url", "link", "Product URL", "url"]
+    url = get_dict_value_ignore_case(product, url_col_candidates)
+    url_col = find_real_column_name(list(product.keys()), url_col_candidates)
+
+    log.info(f"  🔗 Raw URL from DB: {url[:80] if url else 'EMPTY'}...")
+
+    if is_url_truncated(url):
+        log.warning(f"  ⚠️ URL is truncated or invalid. Attempting Flipkart search fallback...")
+
+        # Get product name for search
+        product_name = get_dict_value_ignore_case(
+            product, ["Product Name-2", "Product Name", "name", "Brand Name"]
+        )
+
+        # Search Flipkart to recover URL
+        recovered_url = await search_flipkart_for_url(page, product_name)
+
+        if recovered_url:
+            log.info(f"  🔧 URL recovered: {recovered_url[:80]}...")
+            # Save corrected URL to DB
+            if url_col and product_id:
+                update_product_url(sb, table, product_id, url_col, recovered_url)
+            return recovered_url
+        else:
+            log.error(f"  ❌ Could not recover URL for product: '{product_name}'. Skipping.")
+            return None
+
+    return url
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -507,6 +724,12 @@ async def extract_product_data(page: Page, url: str, browser: Browser) -> dict:
                 log.warning(f"  ⚠️ Redirected to: {current_url[:60]}")
                 return {}
 
+            # Check for 404
+            if "this page doesn't exist" in (await page.title()).lower() or \
+               "page not found" in (await page.title()).lower():
+                log.error(f"  ❌ 404 Page Not Found: {url[:60]}")
+                return {}
+
             if await is_captcha_or_blocked(page):
                 log.warning(f"  🤖 Bot block detected! Will retry with fresh context...")
                 if scrape_attempt < MAX_SCRAPE_RETRIES:
@@ -763,19 +986,31 @@ async def run_mini_agent(agent_config: dict, sb: Client, browser: Browser):
 
     updated = 0
     failed = 0
+    url_recovered = 0
 
     for i, product in enumerate(products, 1):
-        url = get_dict_value_ignore_case(product, ["Product Link", "product_url", "link", "Product URL"])
+        product_id = product.get("id")
 
-        if not url or "flipkart.com" not in url:
-            log.warning(f"  [{label}] ({i}/{len(products)}) No valid Flipkart URL, skipping")
-            continue
-
-        product_name = get_dict_value_ignore_case(product, ["Product Name-2", "Product Name", "name", "Brand Name"])
+        product_name = get_dict_value_ignore_case(
+            product, ["Product Name-2", "Product Name", "name", "Brand Name"]
+        )
         if not product_name:
             product_name = "Unknown"
 
         log.info(f"\n  [{label}] ({i}/{len(products)}) {product_name[:50]}...")
+
+        # ── TRUNCATED URL FIX: Resolve URL before scraping ──
+        url = await resolve_product_url(page, product, sb, table, product_id)
+
+        if not url:
+            log.warning(f"  [{label}] No valid URL available. Skipping.")
+            failed += 1
+            continue
+
+        if not url or "flipkart.com" not in url:
+            log.warning(f"  [{label}] Not a Flipkart URL. Skipping.")
+            failed += 1
+            continue
 
         await human_mouse_move(page)
 
@@ -794,7 +1029,6 @@ async def run_mini_agent(agent_config: dict, sb: Client, browser: Browser):
             failed += 1
             continue
 
-        product_id = product.get("id")
         success = update_product(sb, table, product_id, update_data)
 
         if success:
@@ -824,11 +1058,11 @@ async def run_mini_agent(agent_config: dict, sb: Client, browser: Browser):
 async def main():
     log.info("╔══════════════════════════════════════════════════════════════╗")
     if TEST_MODE:
-        log.info("║  PRICEYAAR SUPER AGENT v7.1 - SINGLE AGENT TEST MODE        ║")
-        log.info("║  🎯 TARGET: earbuds table (20 products)                      ║")
+        log.info("║  PRICEYAAR SUPER AGENT v7.2 - TRUNCATED URL FIX EDITION    ║")
+        log.info("║  🎯 TARGET: earbuds table (20 products)                     ║")
     else:
-        log.info("║  PRICEYAAR SUPER AGENT v7.1 - FULL MODE (All 10 Agents)     ║")
-    log.info("║  Python + Playwright + DOM Strikethrough + Anti-Bot           ║")
+        log.info("║  PRICEYAAR SUPER AGENT v7.2 - FULL MODE (All 10 Agents)    ║")
+    log.info("║  Python + Playwright + DOM Strikethrough + URL Recovery       ║")
     log.info("╚══════════════════════════════════════════════════════════════╝")
     log.info(f"  Active agents: {[a['name'] for a in AGENTS]}")
     log.info(f"  Batch size: {TEST_BATCH_SIZE if TEST_MODE else 10} products per agent")
