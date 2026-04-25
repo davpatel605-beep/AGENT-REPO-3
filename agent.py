@@ -1,4 +1,3 @@
-
 import os
 import time
 import re
@@ -70,6 +69,13 @@ def extract_rating(rating_text):
     match = re.search(r'[\d.]+', rating_text)
     return float(match.group(0)) if match else None
 
+def get_url_from_product(product_data):
+    """Safely extracts URL handling possible case differences in column names."""
+    for key, value in product_data.items():
+        if key.lower() == 'product link':
+            return value
+    return None
+
 def main():
     logging.info("Starting Detailed Price Yaar Intelligent Agent...")
     driver = setup_driver()
@@ -87,10 +93,12 @@ def main():
 
         for product in products:
             product_id = product.get("id")
-            url = product.get("Product link")
             
-            if not url or "flipkart.com" not in url:
-                logging.info(f"Skipping ID {product_id} - Invalid or missing Flipkart URL.")
+            # Use the robust URL extraction function
+            url = get_url_from_product(product)
+            
+            if not url or "flipkart.com" not in str(url):
+                logging.info(f"Skipping ID {product_id} - Invalid or missing Flipkart URL. Value found: {url}")
                 continue
 
             logging.info(f"--- Processing Product ID: {product_id} ---")
@@ -179,3 +187,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
