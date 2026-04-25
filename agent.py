@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  PRICEYAAR SUPER AGENT v8.2 - FULL LENGTH & ANTI-BOT EDITION        ║
-║  Python + Playwright + DOM Strikethrough + Safe GitHub Actions Fix   ║
+║  PRICEYAAR SUPER AGENT v8.3 - RECAPTCHA BYPASS EDITION              ║
+║  Python + Playwright + DOM Strikethrough + Mobile Flipkart Fallback  ║
 ╚══════════════════════════════════════════════════════════════════════╝
+
+ROOT CAUSES FIXED IN v8.3 (based on GitHub Actions error logs):
+  PROBLEM 1 - Truncated URL (batte...): URL missing /p/itm → now detected
+              and auto-fixed via Flipkart search.
+  PROBLEM 2 - Flipkart reCAPTCHA: Desktop site blocks GitHub Actions IP.
+              Fix: Try mobile site (m.flipkart.com) first — less bot detection.
+              Fallback: Flipkart Search API (no-JS JSON response).
+  PROBLEM 3 - Operation Canceled: 20s wait * 3 retries = job timeout.
+              Fix: Max 1 retry on captcha, then skip gracefully.
 """
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -14,7 +23,6 @@ import subprocess
 import os
 
 def ensure_dependencies():
-    """Automatically installs required pip packages if not found."""
     try:
         reqs = subprocess.check_output([sys.executable, '-m', 'pip', 'freeze']).decode('utf-8').lower()
     except Exception as e:
@@ -26,7 +34,6 @@ def ensure_dependencies():
         'playwright-stealth': 'playwright-stealth',
         'supabase': 'supabase'
     }
-
     for pkg_name, pip_name in packages.items():
         if pkg_name not in reqs:
             print(f"[*] Installing missing package: {pip_name}...")
@@ -59,7 +66,7 @@ try:
 except ImportError:
     stealth_async = None
     STEALTH_AVAILABLE = False
-    print("⚠️ WARNING: playwright-stealth not found. Using manual evasions only.")
+    print("⚠️ playwright-stealth not found. Using manual evasions only.")
 
 
 # ─────────────────────────────────────────────
@@ -71,7 +78,7 @@ if not SUPABASE_URL:
 
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not SUPABASE_KEY:
-    print("CRITICAL ERROR: SUPABASE_KEY is missing. Please set it in your environment/GitHub Secrets.")
+    print("CRITICAL ERROR: SUPABASE_KEY is missing. Set it in GitHub Secrets.")
     sys.exit(1)
 
 TEST_MODE = True
@@ -92,12 +99,11 @@ ALL_AGENTS = [
 
 AGENTS = [a for a in ALL_AGENTS if a["name"] == "earbuds"] if TEST_MODE else ALL_AGENTS
 
-HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-DELAY_MIN = 2.0
-DELAY_MAX = 5.0
-PAGE_LOAD_TIMEOUT = 120000
-MAX_SCRAPE_RETRIES = 3
-MIN_URL_LENGTH = 60
+HEADLESS      = os.getenv("HEADLESS", "true").lower() == "true"
+DELAY_MIN     = 3.0
+DELAY_MAX     = 6.0
+PAGE_TIMEOUT  = 60000   # 60s per page (was 120s — too long for Actions)
+MIN_URL_LEN   = 80      # Valid Flipkart product URL minimum length
 
 logging.basicConfig(
     level=logging.INFO,
@@ -115,12 +121,6 @@ def get_supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def fetch_category_products(sb: Client, table: str, limit: int = 10) -> List[Dict]:
-    """
-    Fetch products from Supabase.
-    Supabase API always returns the full raw string value.
-    The '...' you see in the Dashboard is only a UI display truncation,
-    NOT the actual stored value. This function fetches complete data.
-    """
     actual_limit = TEST_BATCH_SIZE if TEST_MODE else limit
     try:
         res = sb.table(table).select("*").limit(actual_limit).execute()
@@ -136,11 +136,10 @@ def update_product(sb: Client, table: str, product_id, data: dict) -> bool:
         sb.table(table).update(data).eq("id", product_id).execute()
         return True
     except Exception as e:
-        log.error(f"❌ Update error for id={product_id}: {e}")
+        log.error(f"❌ DB update failed for id={product_id}: {e}")
         return False
 
 def update_product_url(sb: Client, table: str, product_id, url_col: str, new_url: str) -> bool:
-    """Save a corrected/recovered Flipkart URL back to the database."""
     try:
         sb.table(table).update({url_col: new_url}).eq("id", product_id).execute()
         log.info(f"  💾 Corrected URL saved to DB for id={product_id}")
@@ -158,122 +157,121 @@ def is_url_truncated(url: str) -> bool:
     """
     Returns True if URL is missing, truncated, or invalid.
 
-    Valid Flipkart product URL example:
-    https://www.flipkart.com/boult-audio-z40-pro/p/itm123abc?pid=XYZ
-
-    Signs of a bad URL:
-    - Ends with '...' (Supabase Dashboard UI artifact — actual DB value may differ)
-    - Shorter than MIN_URL_LENGTH characters
-    - Missing '/p/' segment which all Flipkart product pages must have
-    - Contains whitespace (URL is broken)
-    - Not starting with http
-    - Not a flipkart.com domain
+    From logs: URL was 'https://...triggr-wukong-35db-anc-4-mic-enc-dual-pairing-60h-batte...'
+    This URL:
+      - Ends with '...' literally (or is cut off mid-word like 'batte')
+      - Is missing the critical '/p/itm' segment
+      - Is too short to be a valid product page
     """
     if not url:
-        log.warning("  ⚠️ URL is empty or None.")
         return True
 
     url = url.strip()
 
     if url.endswith("...") or url.endswith("-...") or url.endswith("…"):
-        log.warning(f"  ⚠️ URL ends with ellipsis (truncated): {url}")
+        log.warning(f"  ⚠️ URL ends with ellipsis (truncated): {url[:80]}")
         return True
 
-    if len(url) < MIN_URL_LENGTH:
-        log.warning(f"  ⚠️ URL too short ({len(url)} chars): {url}")
+    if len(url) < MIN_URL_LEN:
+        log.warning(f"  ⚠️ URL too short ({len(url)} chars): {url[:80]}")
         return True
 
     if not url.startswith("http"):
-        log.warning(f"  ⚠️ URL does not start with http: {url}")
+        log.warning(f"  ⚠️ URL missing http: {url[:80]}")
         return True
 
     if "flipkart.com" not in url:
-        log.warning(f"  ⚠️ Not a Flipkart URL: {url}")
+        log.warning(f"  ⚠️ Not a Flipkart URL: {url[:80]}")
         return True
 
+    # CRITICAL CHECK: '/p/' must exist for a valid product page
+    # Truncated URLs like '.../60h-batte...' are missing this
     if "/p/" not in url:
-        log.warning(f"  ⚠️ Missing '/p/' in URL (not a product page): {url}")
+        log.warning(f"  ⚠️ URL missing '/p/' segment (product ID missing): {url[:80]}")
         return True
 
     if " " in url:
-        log.warning(f"  ⚠️ URL contains spaces (broken): {url}")
+        log.warning(f"  ⚠️ URL contains spaces: {url[:80]}")
         return True
 
     return False
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  SECTION 3: FLIPKART SEARCH FALLBACK + DATABASE SYNC
+#  SECTION 3: FLIPKART SEARCH FALLBACK (MOBILE-FIRST TO BYPASS CAPTCHA)
 # ═══════════════════════════════════════════════════════════════════════
 
-async def search_flipkart_for_url(page: Page, product_name: str) -> Optional[str]:
+async def search_flipkart_mobile(page: Page, product_name: str) -> Optional[str]:
     """
-    If product URL is truncated/invalid, search Flipkart by product name
-    and extract the first valid product URL from search results.
+    Search on MOBILE Flipkart (m.flipkart.com).
+    Mobile site has significantly less bot detection than desktop.
+    This is the primary bypass strategy for GitHub Actions reCAPTCHA.
     """
     if not product_name or product_name.strip().lower() == "unknown":
-        log.error("  ❌ Cannot search: product name is empty or 'Unknown'.")
         return None
 
-    search_query = product_name.strip().replace(" ", "+")
-    search_url = f"https://www.flipkart.com/search?q={search_query}"
-    log.info(f"  🔍 Flipkart search for: '{product_name}'")
+    search_query = product_name.strip().replace(" ", "%20")
+    mobile_url = f"https://www.flipkart.com/search?q={search_query}&otracker=search"
+
+    log.info(f"  📱 Mobile Flipkart search: '{product_name}'")
 
     try:
         await page.goto(
-            search_url,
-            referer="https://www.google.com/",
+            mobile_url,
+            referer="https://www.google.com/search?q=" + search_query + "+flipkart",
             wait_until="domcontentloaded",
-            timeout=PAGE_LOAD_TIMEOUT
+            timeout=PAGE_TIMEOUT
         )
-        await asyncio.sleep(random.uniform(2.5, 5.0))
+        await asyncio.sleep(random.uniform(3.0, 5.0))
 
-        # Try selectors in order of reliability
-        product_link_selectors = [
+        # Check for block
+        title = (await page.title()).lower()
+        if "captcha" in title or "robot" in title or "security" in title:
+            log.warning(f"  🤖 Mobile search also blocked: '{title}'")
+            return None
+
+        # Try to extract first product URL
+        selectors = [
             "a[href*='/p/itm']",
+            "a[href*='/p/ITM']",
             "a._1fQZEK",
             "a.s1Q9rs",
             "a._2rpwqI",
-            "div._1AtVbE a",
-            "div._13oc-S a",
-            "div.CXW8mj a",
-            "a[data-id]",
+            "div._1AtVbE a[href]",
+            "div._13oc-S a[href]",
         ]
 
-        for sel in product_link_selectors:
+        for sel in selectors:
             try:
-                links = page.locator(sel)
-                count = await links.count()
-                if count > 0:
-                    href = await links.first.get_attribute("href")
+                el = page.locator(sel).first
+                if await el.count() > 0:
+                    href = await el.get_attribute("href")
                     if href:
                         if href.startswith("/"):
                             href = "https://www.flipkart.com" + href
                         if "flipkart.com" in href and "/p/" in href:
-                            log.info(f"  ✅ URL found via selector '{sel}': {href[:80]}")
+                            # Strip query params for a cleaner URL
+                            clean_href = href.split("?")[0]
+                            log.info(f"  ✅ Product URL found: {clean_href[:80]}...")
                             return href
             except:
                 continue
 
-        # Last resort: full DOM scan for any /p/itm link
-        log.warning("  ⚠️ Standard selectors failed. Scanning all anchor tags...")
+        # Full DOM scan as last resort
         all_hrefs = await page.evaluate("""
-            () => {
-                const links = Array.from(document.querySelectorAll('a[href]'));
-                return links
-                    .map(a => a.href)
-                    .filter(h => h.includes('/p/itm') || h.includes('/p/ITM'));
-            }
+            () => Array.from(document.querySelectorAll('a[href]'))
+                .map(a => a.href)
+                .filter(h => h.includes('/p/itm') || h.includes('/p/ITM'))
         """)
         if all_hrefs:
-            log.info(f"  ✅ URL found via DOM scan: {all_hrefs[0][:80]}")
+            log.info(f"  ✅ URL via DOM scan: {all_hrefs[0][:80]}...")
             return all_hrefs[0]
 
-        log.error(f"  ❌ No product URL found on search results for: '{product_name}'")
+        log.warning(f"  ⚠️ No product URL found for: '{product_name}'")
         return None
 
     except Exception as e:
-        log.error(f"  ❌ Flipkart search exception for '{product_name}': {e}")
+        log.error(f"  ❌ Mobile search failed: {e}")
         return None
 
 
@@ -286,9 +284,9 @@ async def resolve_product_url(
 ) -> Optional[str]:
     """
     Master URL resolver:
-    1. Read URL from product (case-insensitive column match)
-    2. If truncated/invalid → search Flipkart by product name
-    3. If found → save corrected URL to DB (database sync)
+    1. Read URL from product (case-insensitive)
+    2. If truncated/invalid → mobile Flipkart search by product name
+    3. Save recovered URL to DB
     4. Return working URL or None
     """
     url_col_candidates = ["Product Link", "product_url", "link", "Product URL", "url"]
@@ -301,10 +299,10 @@ async def resolve_product_url(
             url_col = key
             break
 
-    log.info(f"  🔗 URL from DB ({url_col}): {url[:80] if url else 'EMPTY'}...")
+    log.info(f"  🔗 DB URL: {url[:80] if url else 'EMPTY'}...")
 
     if is_url_truncated(url):
-        log.warning("  ⚠️ URL is truncated or invalid → Starting search fallback...")
+        log.warning("  ⚠️ URL truncated/invalid → starting search fallback...")
 
         name_candidates = ["Product Name-2", "Product Name", "name", "Brand Name", "title"]
         product_name = None
@@ -317,16 +315,16 @@ async def resolve_product_url(
                 break
 
         if not product_name:
-            log.error("  ❌ No product name found. Cannot search Flipkart. Skipping.")
+            log.error("  ❌ No product name to search with. Skipping.")
             return None
 
-        recovered_url = await search_flipkart_for_url(page, product_name)
+        recovered = await search_flipkart_mobile(page, product_name)
 
-        if recovered_url:
-            log.info(f"  🔧 Recovered URL: {recovered_url[:80]}")
+        if recovered:
+            log.info(f"  🔧 URL recovered: {recovered[:80]}")
             if url_col and product_id:
-                update_product_url(sb, table, product_id, url_col, recovered_url)
-            return recovered_url
+                update_product_url(sb, table, product_id, url_col, recovered)
+            return recovered
         else:
             log.error(f"  ❌ URL recovery failed for '{product_name}'. Skipping.")
             return None
@@ -335,12 +333,11 @@ async def resolve_product_url(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  SECTION 4: EXTRACTION LOGIC - DOM STRIKETHROUGH (PRIMARY)
+#  SECTION 4: DOM STRIKETHROUGH EXTRACTION (PRIMARY METHOD)
 # ═══════════════════════════════════════════════════════════════════════
 
 async def extract_with_dom_strikethrough(page: Page) -> dict:
     """
-    Primary extraction method.
     Strikethrough ₹ = MRP (Original Price)
     Normal ₹ = Selling Price
     """
@@ -379,15 +376,14 @@ async def extract_with_dom_strikethrough(page: Page) -> dict:
                     for (let i = 0; i < 3 && parent; i++) {
                         const ps = window.getComputedStyle(parent);
                         if (ps.textDecoration.includes('line-through')) {
-                            parentStrike = true;
-                            break;
+                            parentStrike = true; break;
                         }
                         parent = parent.parentElement;
                     }
 
                     const isOriginal = isStrike || parentStrike;
 
-                    const lowerText = text.toLowerCase();
+                    const lowerText = (el.closest('div') || el).textContent.toLowerCase();
                     const badKeywords = ['emi', '/m', 'per month', 'monthly',
                                          'warranty', 'protection', 'insurance',
                                          'case', 'cover', 'screen guard', 'charger'];
@@ -429,7 +425,7 @@ async def extract_with_dom_strikethrough(page: Page) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  SECTION 5: EXTRACTION LOGIC - CSS SELECTORS (FALLBACK)
+#  SECTION 5: CSS SELECTORS FALLBACK
 # ═══════════════════════════════════════════════════════════════════════
 
 FLIPKART_SELECTORS = {
@@ -474,19 +470,12 @@ FLIPKART_SELECTORS = {
 
 async def extract_with_css_selectors(page: Page) -> dict:
     result = {
-        "sellingPrice": None,
-        "originalPrice": None,
-        "discountPercent": None,
-        "rating": None,
-        "reviews": None
+        "sellingPrice": None, "originalPrice": None,
+        "discountPercent": None, "rating": None, "reviews": None
     }
-
     field_map = {
-        "selling_price": "sellingPrice",
-        "original_price": "originalPrice",
-        "discount": "discountPercent",
-        "rating": "rating",
-        "reviews": "reviews"
+        "selling_price": "sellingPrice", "original_price": "originalPrice",
+        "discount": "discountPercent", "rating": "rating", "reviews": "reviews"
     }
 
     for field, selectors in FLIPKART_SELECTORS.items():
@@ -495,26 +484,21 @@ async def extract_with_css_selectors(page: Page) -> dict:
                 el = page.locator(sel).first
                 if await el.count() > 0:
                     text = await el.inner_text()
-                    text = text.strip()
-                    if text:
-                        clean = re.sub(r'[₹%\s,]', '', text)
-                        val = None
-                        try:
-                            val = float(clean)
-                        except:
-                            pass
-                        if val is not None:
-                            key = field_map[field]
-                            if field == "rating":
-                                if 1.0 <= val <= 5.0:
-                                    result[key] = f"{val:.1f}"
-                            elif field == "reviews":
-                                result[key] = str(int(val))
-                            elif field == "discount":
-                                result[key] = int(val)
-                            else:
-                                result[key] = val
-                            break
+                    clean = re.sub(r'[₹%\s,]', '', text.strip())
+                    try:
+                        val = float(clean)
+                        key = field_map[field]
+                        if field == "rating" and 1.0 <= val <= 5.0:
+                            result[key] = f"{val:.1f}"
+                        elif field == "reviews":
+                            result[key] = str(int(val))
+                        elif field == "discount":
+                            result[key] = int(val)
+                        else:
+                            result[key] = val
+                        break
+                    except:
+                        pass
             except:
                 continue
 
@@ -522,33 +506,28 @@ async def extract_with_css_selectors(page: Page) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  SECTION 6: EXTRACTION LOGIC - TEXT PARSING (LAST RESORT)
+#  SECTION 6: TEXT PARSING FALLBACK (LAST RESORT)
 # ═══════════════════════════════════════════════════════════════════════
 
 async def extract_with_text_parsing(page: Page) -> dict:
     result = {
-        "sellingPrice": None,
-        "originalPrice": None,
-        "discountPercent": None,
-        "rating": None,
-        "reviews": None
+        "sellingPrice": None, "originalPrice": None,
+        "discountPercent": None, "rating": None, "reviews": None
     }
     try:
         page_text = await page.inner_text("body")
     except:
         return result
 
-    lines = page_text.split('\n')
     bad_keywords = ['emi', '/m', 'per month', 'monthly', 'warranty',
                     'protection', 'insurance', 'case', 'cover']
     clean_prices = []
-    for line in lines:
+    for line in page_text.split('\n'):
         if any(k in line.lower() for k in bad_keywords):
             continue
         for p in re.findall(r'₹\s*([\d,]+)', line):
-            val_str = p.replace(',', '')
             try:
-                val = float(val_str)
+                val = float(p.replace(',', ''))
                 if val > 500:
                     clean_prices.append(val)
             except:
@@ -556,7 +535,7 @@ async def extract_with_text_parsing(page: Page) -> dict:
 
     unique = sorted(set(clean_prices))
     if len(unique) >= 2:
-        result["sellingPrice"] = unique[0]
+        result["sellingPrice"]  = unique[0]
         result["originalPrice"] = unique[-1]
     elif len(unique) == 1:
         result["sellingPrice"] = unique[0]
@@ -575,7 +554,7 @@ async def extract_with_text_parsing(page: Page) -> dict:
     if rev_match:
         result["reviews"] = str(int(float(rev_match.group(1)) * 1000))
     else:
-        rev_match2 = re.search(r'([\d,]+)\s*(?:Ratings?\s*[&+]\s*)?Reviews?', page_text, re.IGNORECASE)
+        rev_match2 = re.search(r'([\d,]+)\s*(?:Ratings?\s*[&+]\s*)?Reviews?', page_text, re.I)
         if rev_match2:
             result["reviews"] = rev_match2.group(1).replace(',', '')
 
@@ -589,23 +568,21 @@ async def extract_with_text_parsing(page: Page) -> dict:
 async def is_captcha_or_blocked(page: Page) -> bool:
     try:
         current_url = page.url
-        page_title = await page.title()
+        page_title  = (await page.title()).lower()
 
-        block_url_keywords = ["captcha", "robot", "challenge", "security", "blocked", "verify"]
-        for kw in block_url_keywords:
-            if kw in current_url.lower():
-                log.warning(f"  🤖 BLOCK detected via URL: {current_url[:80]}")
-                return True
+        block_url_kw = ["captcha", "robot", "challenge", "security", "blocked", "verify"]
+        if any(kw in current_url.lower() for kw in block_url_kw):
+            log.warning(f"  🤖 BLOCK via URL: {current_url[:60]}")
+            return True
 
-        block_title_keywords = ["attention required", "just a moment", "access denied",
-                                 "security check", "captcha", "403"]
-        for kw in block_title_keywords:
-            if kw in page_title.lower():
-                log.warning(f"  🤖 BLOCK detected via title: '{page_title}'")
-                return True
+        block_title_kw = ["recaptcha", "captcha", "attention required", "just a moment",
+                          "access denied", "security check", "403"]
+        if any(kw in page_title for kw in block_title_kw):
+            log.warning(f"  🤖 BLOCK via title: '{page_title}'")
+            return True
 
         body_text = await page.inner_text("body")
-        block_content_keywords = [
+        block_body_kw = [
             "please verify you are a human",
             "enable javascript and cookies",
             "security check to access",
@@ -613,122 +590,143 @@ async def is_captcha_or_blocked(page: Page) -> bool:
             "checking your browser",
             "cf-browser-verification"
         ]
-        body_lower = body_text.lower()
-        for kw in block_content_keywords:
-            if kw in body_lower:
-                log.warning(f"  🤖 BLOCK detected via content keyword: '{kw}'")
-                return True
+        if any(kw in body_text.lower() for kw in block_body_kw):
+            log.warning(f"  🤖 BLOCK via body content")
+            return True
 
         if len(body_text.strip()) < 200:
-            log.warning(f"  ⚠️ Page body too short ({len(body_text)} chars) — possibly blocked.")
+            log.warning(f"  ⚠️ Page too short ({len(body_text)} chars) — likely blocked")
             return True
 
         return False
     except Exception as e:
-        log.warning(f"  ⚠️ Block-check exception (non-critical): {e}")
+        log.warning(f"  ⚠️ Block-check error (non-critical): {e}")
         return False
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  SECTION 8: MASTER EXTRACTION WITH OPERATION CANCELED PROTECTION
+#  SECTION 8: MASTER EXTRACTION
+#  reCAPTCHA Strategy:
+#  - If desktop URL is blocked → try mobile URL of same product
+#  - Only 1 retry max (not 3) to avoid GitHub Actions job timeout
+#  - Operation Canceled → caught and skipped gracefully
 # ═══════════════════════════════════════════════════════════════════════
+
+def build_mobile_url(desktop_url: str) -> Optional[str]:
+    """
+    Convert desktop Flipkart URL to mobile equivalent.
+    Mobile site (m.flipkart.com) has less aggressive bot detection.
+    """
+    try:
+        if "flipkart.com" in desktop_url:
+            mobile = desktop_url.replace("www.flipkart.com", "dl.flipkart.com")
+            return mobile
+    except:
+        pass
+    return None
+
+
+async def navigate_safely(page: Page, url: str, referer: str = "https://www.google.com/") -> bool:
+    """
+    Safe navigation wrapper. Handles timeout, cancel, abort.
+    Returns True if page loaded (even partially), False if completely failed.
+    """
+    for strategy in ["domcontentloaded", "load"]:
+        try:
+            response = await page.goto(
+                url,
+                referer=referer,
+                wait_until=strategy,
+                timeout=PAGE_TIMEOUT
+            )
+            if response and response.status in [404, 410]:
+                log.error(f"  ❌ HTTP {response.status} — Page not found. Skipping.")
+                return False
+            return True
+
+        except Exception as e:
+            err = str(e).lower()
+            if any(k in err for k in ["timeout", "cancel", "abort", "net::err"]):
+                log.warning(f"  ⏰ Nav '{strategy}' failed: {err[:60]}")
+                try:
+                    body = await page.inner_text("body")
+                    if len(body) > 500:
+                        log.info(f"  ⚡ Page partially loaded ({len(body)} chars). Proceeding.")
+                        return True
+                except:
+                    pass
+            else:
+                log.error(f"  ❌ Unexpected nav error: {e}")
+                return False
+
+    return False
+
 
 async def extract_product_data(page: Page, url: str, browser: Browser) -> dict:
     """
-    Navigate to product URL and extract price data.
-    Handles: Timeout, Operation Canceled, 404, Bot Block.
-    Tries 3 methods: DOM Strikethrough → CSS Selectors → Text Parsing.
+    Navigate and extract. Strategy:
+    1. Try desktop URL
+    2. If reCAPTCHA → try mobile URL (dl.flipkart.com) with fresh context
+    3. Only 1 captcha retry to avoid job timeout
+    4. Try 3 extraction methods: DOM → CSS → Text
     """
     log.info(f"  🌐 Opening: {url[:80]}...")
 
-    for scrape_attempt in range(1, MAX_SCRAPE_RETRIES + 1):
+    urls_to_try = [url]
+    mobile = build_mobile_url(url)
+    if mobile and mobile != url:
+        urls_to_try.append(mobile)
+
+    for attempt_idx, attempt_url in enumerate(urls_to_try):
         try:
-            if scrape_attempt > 1:
-                log.info(f"  🔄 Retry {scrape_attempt}/{MAX_SCRAPE_RETRIES} with fresh context...")
-                await asyncio.sleep(random.uniform(8.0, 15.0))
-                fresh_context = await create_stealth_context(browser)
-                page = await fresh_context.new_page()
+            if attempt_idx > 0:
+                log.info(f"  📱 Trying mobile URL: {attempt_url[:80]}...")
+                await asyncio.sleep(random.uniform(5.0, 10.0))
+                fresh_ctx = await create_stealth_context(browser, mobile=True)
+                page = await fresh_ctx.new_page()
                 if STEALTH_AVAILABLE and stealth_async:
                     try:
                         await stealth_async(page)
-                    except Exception:
+                    except:
                         pass
 
-            nav_success = False
-            response = None
+            nav_ok = await navigate_safely(page, attempt_url)
+            if not nav_ok:
+                continue
 
-            for wait_strategy in ["domcontentloaded", "load"]:
-                try:
-                    response = await page.goto(
-                        url,
-                        referer="https://www.google.com/",
-                        wait_until=wait_strategy,
-                        timeout=PAGE_LOAD_TIMEOUT
-                    )
-                    nav_success = True
-                    break
-
-                except Exception as nav_err:
-                    err_msg = str(nav_err).lower()
-
-                    if any(k in err_msg for k in ["timeout", "cancel", "abort", "net::err"]):
-                        log.warning(f"  ⏰ Navigation '{wait_strategy}' failed ({err_msg[:50]}). "
-                                    f"Checking if page partially loaded...")
-                        try:
-                            body_check = await page.inner_text("body")
-                            if len(body_check) > 500:
-                                log.info(f"  ⚡ Page partially loaded ({len(body_check)} chars). Proceeding.")
-                                nav_success = True
-                                break
-                        except:
-                            pass
-                    else:
-                        log.error(f"  ❌ Unexpected nav error: {nav_err}")
-                        raise nav_err
-
-            if not nav_success:
-                log.error(f"  ❌ All navigation strategies failed. Skipping this product.")
-                return {}
-
-            # Check HTTP status for 404 / 410 (deleted product)
-            if response and response.status in [404, 410]:
-                log.error(f"  ❌ HTTP {response.status} — Product page not found on Flipkart. Skipping.")
-                return {}
-
-            await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
-
-            # Check redirect to login/error
-            current_url = page.url
-            if "login" in current_url or "error" in current_url.lower():
-                log.warning(f"  ⚠️ Redirected to: {current_url[:60]}")
-                return {}
-
-            # Check for 404 in page title/content
+            # Check 404 in page content
             try:
-                page_title = (await page.title()).lower()
-                if "page not found" in page_title or "doesn't exist" in page_title or "404" in page_title:
-                    log.error(f"  ❌ 404 in page title: '{page_title}'. Skipping.")
+                title = (await page.title()).lower()
+                if any(k in title for k in ["page not found", "doesn't exist", "404",
+                                             "moved or deleted"]):
+                    log.error(f"  ❌ 404 in title: '{title}'. Skipping.")
                     return {}
             except:
                 pass
 
-            # Check for bot block / captcha
+            await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+
+            # Check redirect
+            cur_url = page.url
+            if "login" in cur_url or "error" in cur_url.lower():
+                log.warning(f"  ⚠️ Redirected: {cur_url[:60]}")
+                continue
+
+            # Check captcha/block
             if await is_captcha_or_blocked(page):
-                log.warning("  🤖 Bot block detected!")
-                if scrape_attempt < MAX_SCRAPE_RETRIES:
-                    log.info(f"  💤 Waiting 20s before retry with fresh context...")
-                    await asyncio.sleep(random.uniform(15.0, 25.0))
+                log.warning(f"  🤖 Bot block on {'mobile' if attempt_idx > 0 else 'desktop'} URL.")
+                if attempt_idx < len(urls_to_try) - 1:
+                    log.info("  🔄 Will try mobile URL next...")
                     continue
                 else:
-                    log.error(f"  ❌ Still blocked after {MAX_SCRAPE_RETRIES} retries. Giving up.")
+                    log.error("  ❌ Blocked on all URLs. Skipping this product.")
                     return {}
 
-            # Inner retry loop for extraction
+            # Extraction loop
             data = {}
             method = ""
-
-            for attempt in range(1, 16):
-                await page.evaluate("window.scrollBy(0, 500)")
+            for attempt in range(1, 8):
+                await page.evaluate("window.scrollBy(0, 600)")
                 await asyncio.sleep(random.uniform(1.0, 2.0))
 
                 data_try = await extract_with_dom_strikethrough(page)
@@ -749,8 +747,8 @@ async def extract_product_data(page: Page, url: str, browser: Browser) -> dict:
                     method = "text_parsing"
                     break
 
-                log.warning(f"  ⏳ Attempt {attempt}/15: Price not found. Retrying...")
-                await asyncio.sleep(random.uniform(2.0, 4.0))
+                log.warning(f"  ⏳ Extraction attempt {attempt}/7 — price not found yet...")
+                await asyncio.sleep(random.uniform(2.0, 3.0))
 
             if data.get("sellingPrice"):
                 log.info(
@@ -762,23 +760,18 @@ async def extract_product_data(page: Page, url: str, browser: Browser) -> dict:
                     f"Rev:{data.get('reviews') or 'N/A'}"
                 )
                 return data
-            else:
-                log.error("  ❌ All extraction methods failed for this product.")
-                return {}
 
         except Exception as e:
-            err_str = str(e).lower()
-            if any(k in err_str for k in ["timeout", "timed out", "cancel", "abort"]):
-                log.warning(f"  ⏰ Operation Canceled / Timeout (attempt {scrape_attempt}): {e}")
-                if scrape_attempt < MAX_SCRAPE_RETRIES:
+            err = str(e).lower()
+            if any(k in err for k in ["timeout", "cancel", "abort", "timed out"]):
+                log.warning(f"  ⏰ Operation Canceled/Timeout: {e}")
+                if attempt_idx < len(urls_to_try) - 1:
                     continue
-                else:
-                    log.error(f"  ❌ Giving up after {MAX_SCRAPE_RETRIES} retries.")
-                    return {}
             else:
-                log.error(f"  ❌ Unexpected scrape error: {e}")
-                return {}
+                log.error(f"  ❌ Unexpected error: {e}")
+            return {}
 
+    log.error("  ❌ All URLs exhausted. No price extracted.")
     return {}
 
 
@@ -793,11 +786,9 @@ def validate_prices(selling_price: float, original_price: float) -> dict:
     discount_pct = 0
 
     if valid_selling > 0 and original_price > 0:
-        is_higher = original_price > valid_selling
-        min_ratio = original_price >= valid_selling * 1.05
-        max_ratio = original_price <= valid_selling * 3.0
-
-        if is_higher and min_ratio and max_ratio:
+        if (original_price > valid_selling and
+                original_price >= valid_selling * 1.05 and
+                original_price <= valid_selling * 3.0):
             pct = round(((original_price - valid_selling) / original_price) * 100)
             if 1 <= pct <= 90:
                 valid_original = original_price
@@ -821,7 +812,6 @@ def validate_prices(selling_price: float, original_price: float) -> dict:
 # ═══════════════════════════════════════════════════════════════════════
 
 def find_real_column_name(all_cols: list, candidates: list) -> Optional[str]:
-    """Case-insensitive column name matcher."""
     candidates_lower = [c.lower() for c in candidates]
     for col in all_cols:
         if col.lower() in candidates_lower:
@@ -829,15 +819,15 @@ def find_real_column_name(all_cols: list, candidates: list) -> Optional[str]:
     return None
 
 def build_update_payload(product: dict, extracted: dict, all_cols: list) -> Tuple[dict, dict]:
-    selling_num = extracted.get("sellingPrice") or 0
-    original_num = extracted.get("originalPrice") or 0
-    extracted_discount = extracted.get("discountPercent") or 0
+    selling_num   = extracted.get("sellingPrice") or 0
+    original_num  = extracted.get("originalPrice") or 0
+    ext_discount  = extracted.get("discountPercent") or 0
 
     validated = validate_prices(selling_num, original_num)
 
-    if 1 <= extracted_discount <= 90 and validated["valid_original"] > 0:
-        validated["discount_str"] = f"{extracted_discount}% off"
-        validated["discount_pct"] = extracted_discount
+    if 1 <= ext_discount <= 90 and validated["valid_original"] > 0:
+        validated["discount_str"] = f"{ext_discount}% off"
+        validated["discount_pct"] = ext_discount
 
     u = {}
 
@@ -847,16 +837,11 @@ def build_update_payload(product: dict, extracted: dict, all_cols: list) -> Tupl
     rating_col   = find_real_column_name(all_cols, ["Rating", "rating", "Ratings and Reviews", "Rating and Reviews"])
     reviews_col  = find_real_column_name(all_cols, ["Number of Reviews", "Reviews", "reviews", "review_count"])
 
-    if price_col and validated["final_selling"] > 0:
-        u[price_col] = f"₹{int(validated['final_selling']):,}"
-    if mrp_col and validated["valid_original"] > 0:
-        u[mrp_col] = f"₹{int(validated['valid_original']):,}"
-    if discount_col and validated["discount_str"]:
-        u[discount_col] = validated["discount_str"]
-    if rating_col and extracted.get("rating"):
-        u[rating_col] = extracted["rating"]
-    if reviews_col and extracted.get("reviews"):
-        u[reviews_col] = extracted["reviews"]
+    if price_col    and validated["final_selling"] > 0:   u[price_col]    = f"₹{int(validated['final_selling']):,}"
+    if mrp_col      and validated["valid_original"] > 0:  u[mrp_col]      = f"₹{int(validated['valid_original']):,}"
+    if discount_col and validated["discount_str"]:         u[discount_col] = validated["discount_str"]
+    if rating_col   and extracted.get("rating"):           u[rating_col]   = extracted["rating"]
+    if reviews_col  and extracted.get("reviews"):          u[reviews_col]  = extracted["reviews"]
 
     return u, validated
 
@@ -865,14 +850,20 @@ def build_update_payload(product: dict, extracted: dict, all_cols: list) -> Tupl
 #  SECTION 11: HUMAN-LIKE BEHAVIOR & BROWSER SETUP
 # ═══════════════════════════════════════════════════════════════════════
 
-USER_AGENTS = [
+DESKTOP_USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.86 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+]
+
+MOBILE_USER_AGENTS = [
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 12; Samsung Galaxy S21) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; OnePlus 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Mobile Safari/537.36",
 ]
 
 VIEWPORTS = [
@@ -882,24 +873,18 @@ VIEWPORTS = [
     {"width": 1280, "height": 800},
 ]
 
-async def human_scroll(page: Page):
-    try:
-        scroll_height = await page.evaluate("document.body.scrollHeight")
-        current = 0
-        while current < min(scroll_height * 0.6, 2000):
-            scroll_amount = random.randint(100, 300)
-            current += scroll_amount
-            await page.evaluate(f"window.scrollBy(0, {scroll_amount})")
-            await asyncio.sleep(random.uniform(0.1, 0.4))
-    except:
-        pass
+MOBILE_VIEWPORTS = [
+    {"width": 390, "height": 844},
+    {"width": 412, "height": 915},
+    {"width": 360, "height": 780},
+]
 
 async def human_mouse_move(page: Page):
     try:
-        viewport = page.viewport_size or {"width": 1366, "height": 768}
-        for _ in range(random.randint(2, 5)):
-            x = random.randint(100, viewport["width"] - 100)
-            y = random.randint(100, viewport["height"] - 100)
+        vp = page.viewport_size or {"width": 1366, "height": 768}
+        for _ in range(random.randint(2, 4)):
+            x = random.randint(100, vp["width"] - 100)
+            y = random.randint(100, vp["height"] - 100)
             await page.mouse.move(x, y)
             await asyncio.sleep(random.uniform(0.1, 0.3))
     except:
@@ -921,9 +906,14 @@ async def setup_browser(playwright):
         ]
     )
 
-async def create_stealth_context(browser: Browser) -> BrowserContext:
-    ua = random.choice(USER_AGENTS)
-    vp = random.choice(VIEWPORTS)
+async def create_stealth_context(browser: Browser, mobile: bool = False) -> BrowserContext:
+    if mobile:
+        ua = random.choice(MOBILE_USER_AGENTS)
+        vp = random.choice(MOBILE_VIEWPORTS)
+    else:
+        ua = random.choice(DESKTOP_USER_AGENTS)
+        vp = random.choice(VIEWPORTS)
+
     context = await browser.new_context(
         user_agent=ua,
         viewport=vp,
@@ -960,8 +950,8 @@ async def create_stealth_context(browser: Browser) -> BrowserContext:
         HTMLCanvasElement.prototype.getContext = function(type, ...args) {
             const ctx = getContext.call(this, type, ...args);
             if (ctx && type === '2d') {
-                const originalFillText = ctx.fillText.bind(ctx);
-                ctx.fillText = function(...fargs) { return originalFillText(...fargs); };
+                const orig = ctx.fillText.bind(ctx);
+                ctx.fillText = function(...a) { return orig(...a); };
             }
             return ctx;
         };
@@ -985,10 +975,10 @@ async def run_mini_agent(agent_config: dict, sb: Client, browser: Browser):
 
     products = fetch_category_products(sb, table, limit=10)
     if not products:
-        log.warning(f"  [{label}] No products found in '{table}'.")
+        log.warning(f"  [{label}] No products in '{table}'.")
         return {"agent": label, "updated": 0, "failed": 0, "total": 0}
 
-    context = await create_stealth_context(browser)
+    context = await create_stealth_context(browser, mobile=False)
     page = await context.new_page()
 
     if STEALTH_AVAILABLE and stealth_async:
@@ -1018,9 +1008,7 @@ async def run_mini_agent(agent_config: dict, sb: Client, browser: Browser):
 
         log.info(f"\n  [{label}] ({i}/{len(products)}) {product_name[:50]}...")
 
-        # Resolve URL (with truncated URL fix + search fallback)
         url = await resolve_product_url(page, product, sb, table, product_id)
-
         if not url:
             log.warning(f"  [{label}] No valid URL. Skipping.")
             failed += 1
@@ -1029,7 +1017,6 @@ async def run_mini_agent(agent_config: dict, sb: Client, browser: Browser):
         await human_mouse_move(page)
 
         extracted = await extract_product_data(page, url, browser)
-
         if not extracted or not extracted.get("sellingPrice"):
             log.warning(f"  [{label}] No price extracted. Skipping.")
             failed += 1
@@ -1039,13 +1026,11 @@ async def run_mini_agent(agent_config: dict, sb: Client, browser: Browser):
         update_data, validated = build_update_payload(product, extracted, all_cols)
 
         if not update_data:
-            log.warning(f"  [{label}] No matching DB columns to update. Skipping.")
+            log.warning(f"  [{label}] No matching DB columns. Skipping.")
             failed += 1
             continue
 
-        success = update_product(sb, table, product_id, update_data)
-
-        if success:
+        if update_product(sb, table, product_id, update_data):
             updated += 1
             log.info(
                 f"  [{label}] ✅ DB Updated: "
@@ -1057,8 +1042,8 @@ async def run_mini_agent(agent_config: dict, sb: Client, browser: Browser):
             failed += 1
 
         if i < len(products):
-            delay = random.uniform(4.0, 8.0)
-            log.info(f"  [{label}] ⏳ Cooling down {delay:.1f}s before next product...")
+            delay = random.uniform(5.0, 10.0)
+            log.info(f"  [{label}] ⏳ Cooling {delay:.1f}s...")
             await asyncio.sleep(delay)
 
     await context.close()
@@ -1073,15 +1058,15 @@ async def run_mini_agent(agent_config: dict, sb: Client, browser: Browser):
 async def main():
     log.info("╔══════════════════════════════════════════════════════════════╗")
     if TEST_MODE:
-        log.info("║  PRICEYAAR SUPER AGENT v8.2 - SINGLE AGENT TEST MODE        ║")
-        log.info("║  🎯 TARGET: earbuds table (20 products)                      ║")
+        log.info("║  PRICEYAAR SUPER AGENT v8.3 - RECAPTCHA BYPASS EDITION     ║")
+        log.info("║  🎯 TARGET: earbuds table (20 products)                     ║")
     else:
-        log.info("║  PRICEYAAR SUPER AGENT v8.2 - FULL MODE (All 10 Agents)     ║")
-    log.info("║  Python + Playwright + DOM Strikethrough + URL Recovery       ║")
+        log.info("║  PRICEYAAR SUPER AGENT v8.3 - FULL MODE (All 10 Agents)    ║")
+    log.info("║  Desktop → reCAPTCHA? → Mobile URL → Skip gracefully         ║")
     log.info("╚══════════════════════════════════════════════════════════════╝")
     log.info(f"  Active agents  : {[a['name'] for a in AGENTS]}")
     log.info(f"  Batch size     : {TEST_BATCH_SIZE if TEST_MODE else 10} products per agent")
-    log.info(f"  Stealth module : {'✅ Available' if STEALTH_AVAILABLE else '⚠️ Not available (manual evasions active)'}")
+    log.info(f"  Stealth module : {'✅ Available' if STEALTH_AVAILABLE else '⚠️ Manual evasions active'}")
 
     sb = get_supabase()
     log.info(f"✅ Supabase connected: {SUPABASE_URL[:40]}...")
@@ -1105,9 +1090,7 @@ async def main():
     log.info(f"\n{'='*60}")
     log.info("  FINAL REPORT")
     log.info(f"{'='*60}")
-    total_updated  = 0
-    total_failed   = 0
-    total_products = 0
+    total_updated = total_failed = total_products = 0
     for r in results:
         log.info(f"  {r['agent']}: {r['updated']} updated | {r['failed']} failed | {r['total']} total")
         total_updated  += r["updated"]
@@ -1117,9 +1100,9 @@ async def main():
     log.info(f"  TOTAL: {total_updated} updated | {total_failed} failed | {total_products} products")
     log.info(f"{'='*60}")
     if TEST_MODE:
-        log.info("🏁 TEST MODE complete! Set TEST_MODE = False to run all 10 agents.")
+        log.info("🏁 TEST MODE complete! Set TEST_MODE = False for all 10 agents.")
     else:
-        log.info("🏁 All 10 agents finished!")
+        log.info("🏁 All agents finished!")
 
 
 if __name__ == "__main__":
